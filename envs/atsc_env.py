@@ -11,6 +11,8 @@ from sumolib import checkBinary
 import time
 import traci
 import xml.etree.cElementTree as ET
+import socket
+import random
 
 DEFAULT_PORT = 8000
 SEC_IN_MS = 1000
@@ -112,6 +114,15 @@ class TrafficSimulator:
         self._init_nodes()
         self.terminate()
 
+    def _close_sim(self):
+        """Safely close an existing TraCI connection / SUMO process."""
+        if hasattr(self, "sim") and self.sim is not None:
+            try:
+                self.sim.close(False)
+            except Exception:
+                pass
+            self.sim = None
+
     def collect_tripinfo(self):
         # read trip xml, has to be called externally to get complete file
         trip_file = self.output_path + ('%s_%s_trip.xml' % (self.name, self.agent))
@@ -177,7 +188,17 @@ class TrafficSimulator:
             seed = self.seed
         else:
             seed = self.test_seeds[test_ind]
-        self._init_sim(seed, gui=gui)
+        # retry initialization on TraCI failure
+        for attempt in range(3):
+            try:
+                self._close_sim()
+                self._init_sim(seed, gui=gui)
+                break
+            except RuntimeError as e:
+                logging.warning(f"TraCI init failed ({e}), retry {attempt+1}/3")
+                time.sleep(random.uniform(0.5, 1.5))
+        else:
+            raise RuntimeError("reset() failed 3 times in a row")
         self.cur_sec = 0
         self.cur_episode += 1
         # initialize fingerprint
@@ -359,6 +380,16 @@ class TrafficSimulator:
         return [np.ones(self.n_a_ls[i]) / self.n_a_ls[i] for i in range(self.n_agent)]
 
     def _init_sim(self, seed, gui=False):
+        # avoid port conflict by picking a free port
+        def _pick_free_port(start_port, max_tries=50):
+            p = start_port
+            for _ in range(max_tries):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    if s.connect_ex(("127.0.0.1", p)) != 0:
+                        return p
+                p += 1
+            raise RuntimeError("No free port in range")
+        self.port = _pick_free_port(self.port)
         sumocfg_file = self._init_sim_config(seed)
         if gui:
             app = 'sumo-gui'
@@ -379,6 +410,21 @@ class TrafficSimulator:
         # wait 1s to establish the traci server
         time.sleep(1)
         self.sim = traci.connect(port=self.port)
+        # confirm the TraCI connection is ready
+        max_try = 5
+        for i in range(max_try):
+            try:
+                self.sim.simulation.getTime()
+                break
+            except (traci.exceptions.FatalTraCIError, traci.exceptions.TraCIException):
+                time.sleep(1)
+        else:
+            try:
+                self.sim.close(False)
+            except Exception:
+                pass
+            raise RuntimeError(f"TraCI connection failed after {max_try}s")
+        self.traci = self.sim
 
     def _init_sim_config(self):
         # needs to be overwriteen

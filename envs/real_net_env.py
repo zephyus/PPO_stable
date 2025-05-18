@@ -13,6 +13,7 @@ import time
 from collections import deque
 from envs.atsc_env import PhaseMap, PhaseSet, TrafficSimulator
 from envs.real_net_data.build_file import gen_rou_file
+import traci  # add at top for TraciException
 
 sns.set_color_codes()
 
@@ -169,6 +170,41 @@ class RealNetEnv(TrafficSimulator):
         self.flow_rate = config.getint('flow_rate')
         super().__init__(config, output_path, is_record, record_stat, port=port)
 
+        # init per-episode statistics
+        self._reset_episode_stats()
+
+    def _reset_episode_stats(self):
+        # zero counters for this episode
+        self.ep_total_halting_vehicles       = 0.0
+        self.ep_total_lane_waiting_time      = 0.0
+        self.ep_total_vehicle_speed          = 0.0
+        self.ep_num_vehicle_speed_samples    = 0
+        self.ep_arrived_vehicles_episode     = 0
+        self.ep_step_count                   = 0
+
+    def reset(self, *args, **kwargs):
+        # reset episode stats
+        self._reset_episode_stats()
+        # parent reset establishes new traci connection
+        obs = super().reset(*args, **kwargs)
+        # --- refresh lane cache, rebuild incoming-lane list ---
+        try:
+            self._valid_lanes = set(self.traci.lane.getIDList())
+        except Exception:
+            self._valid_lanes = set()
+        lanes = []
+        for nm in self.node_names:
+            if nm in self.nodes and hasattr(self.nodes[nm], 'lanes_in'):
+                lanes += self.nodes[nm].lanes_in
+        self.all_controlled_tls_incoming_lanes = [
+            l for l in lanes
+            if l in self._valid_lanes and not l.startswith(':')
+        ]
+        # debug: print monitored lanes
+        print(f"DEBUG: self.all_controlled_tls_incoming_lanes = {self.all_controlled_tls_incoming_lanes}")
+        print(f"DEBUG: Number of lanes being monitored for stats = {len(self.all_controlled_tls_incoming_lanes)}")
+        return obs
+
     def _bfs(self, i):
         d = 0
         self.distance_mask[i, i] = d
@@ -248,6 +284,52 @@ class RealNetEnv(TrafficSimulator):
                             self.flow_rate,
                             seed=seed,
                             thread=self.sim_thread)
+
+    def step(self, action):
+        # perform one simulation step
+        next_ob, reward, done, global_reward = super().step(action)
+        # accumulate stats
+        self.ep_step_count += 1
+        if hasattr(self, 'all_controlled_tls_incoming_lanes'):
+            hsum = 0
+            wsum = 0
+            non_zero_stat_this_step = False
+            for l in self.all_controlled_tls_incoming_lanes:
+                try:
+                    hn = self.traci.lane.getLastStepHaltingNumber(l)
+                    wt = self.traci.lane.getWaitingTime(l)
+                    if hn > 0 or wt > 0:
+                        # debug: print non-zero lane stats
+                        print(f"DEBUG: SimTime={self.traci.simulation.getTime():.2f}, "
+                              f"Lane={l}, HaltingVehicles={hn}, WaitingTime={wt}")
+                        non_zero_stat_this_step = True
+                    hsum += hn
+                    wsum += wt
+                except traci.exceptions.TraCIException as e:
+                    continue
+            self.ep_total_halting_vehicles       += hsum
+            self.ep_total_lane_waiting_time      += wsum
+        # vehicle speeds
+        vids = self.traci.vehicle.getIDList()
+        if vids:
+            ss = sum(self.traci.vehicle.getSpeed(v) for v in vids)
+            self.ep_total_vehicle_speed       += ss
+            self.ep_num_vehicle_speed_samples += len(vids)
+        # arrived vehicles
+        self.ep_arrived_vehicles_episode += self.traci.simulation.getArrivedNumber()
+        return next_ob, reward, done, global_reward
+
+    def get_episode_statistics(self):
+        """Compute and return average and total metrics for the episode."""
+        steps = self.ep_step_count or 1
+        samples = self.ep_num_vehicle_speed_samples or 1
+        return {
+            "AvgTotalQueueLength_PerStep":      self.ep_total_halting_vehicles / steps,
+            "AvgTotalLaneWaitingTime_PerStep":  self.ep_total_lane_waiting_time / steps,
+            "AvgVehicleSpeed_MS":               self.ep_total_vehicle_speed / samples,
+            "TotalArrivedVehicles_Episode":     self.ep_arrived_vehicles_episode,
+            "EpisodeActualSteps":               self.ep_step_count
+        }
 
     def plot_stat(self, rewards):
         self.state_stat['reward'] = rewards

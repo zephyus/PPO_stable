@@ -37,20 +37,24 @@ class IA2C:
     #重點看一下backward他到底要看哪些東西
     def backward(self, Rends, dt, summary_writer=None, global_step=None):
         self.optimizer.zero_grad()
+        losses_to_return = None
         for i in range(self.n_agent):
             obs, nas, acts, dones, Rs, Advs = self.trans_buffer[i].sample_transition(Rends[i], dt)
+            # call backward and save agent0 losses
+            current_losses = self.policy[i].backward(
+                obs, nas, acts, dones, Rs, Advs,
+                self.e_coef, self.v_coef,
+                summary_writer=summary_writer if i == 0 else None,
+                global_step=global_step if i == 0 else None
+            )
             if i == 0:
-                self.policy[i].backward(obs, nas, acts, dones, Rs, Advs,
-                                        self.e_coef, self.v_coef,
-                                        summary_writer=summary_writer, global_step=global_step)
-            else:
-                self.policy[i].backward(obs, nas, acts, dones, Rs, Advs,
-                                        self.e_coef, self.v_coef)
+                losses_to_return = current_losses
         if self.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.optimizer.step()
         if self.lr_decay != 'constant':
-            self._update_lr()
+            self._update_lr(global_step)  # pass global_step
+        return losses_to_return
 
     def forward(self, obs, done, nactions=None, out_type='p'):
         out = []
@@ -222,9 +226,9 @@ class IA2C:
             # init replay buffer
             self.trans_buffer.append(OnPolicyBuffer(gamma, coop_gamma, distance_mask[i]))
 
-    def _update_lr(self):
+    def _update_lr(self, global_step):  # add global_step parameter
         # TODO: refactor this using optim.lr_scheduler
-        cur_lr = self.lr_scheduler.get(self.n_step)
+        cur_lr = self.lr_scheduler.get(global_step)  # use global_step
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = cur_lr
 
@@ -283,13 +287,17 @@ class MA2C_NC(IA2C):
     def backward(self, Rends, dt, summary_writer=None, global_step=None):
         self.optimizer.zero_grad()
         obs, ps, acts, dones, Rs, Advs = self.trans_buffer.sample_transition(Rends, dt)
-        self.policy.backward(obs, ps, acts, dones, Rs, Advs, self.e_coef, self.v_coef,
-                             summary_writer=summary_writer, global_step=global_step)
+        # capture losses from multi-agent policy backward
+        policy_loss, value_loss, entropy_loss, total_loss = \
+            self.policy.backward(obs, ps, acts, dones, Rs, Advs,
+                                 self.e_coef, self.v_coef,
+                                 summary_writer=summary_writer, global_step=global_step)
         if self.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.optimizer.step()
         if self.lr_decay != 'constant':
-            self._update_lr()
+            self._update_lr(global_step)  # pass global_step
+        return policy_loss, value_loss, entropy_loss, total_loss
 
     def forward(self, obs, done, ps, actions=None, out_type='p'):
         if self.identical_agent:

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import os
 import logging
 from agents.utils import batch_to_seq, init_layer, one_hot, run_rnn
-from agents.gat import GraphAttention
+from torch_geometric.nn import GATConv
 
 
 class Policy(nn.Module):
@@ -111,6 +111,11 @@ class LstmPolicy(Policy):
         self.loss.backward()
         if summary_writer is not None:
             self._update_tensorboard(summary_writer, global_step)
+        # return scalar losses for logging
+        return (self.policy_loss,
+                self.value_loss,
+                self.entropy_loss,
+                self.loss)
 
     def forward(self, ob, done, naction=None, out_type='p'):
         ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float().cuda()
@@ -193,12 +198,6 @@ class NCMultiAgentPolicy(Policy):
         self.use_gat = use_gat_env_value == '1'
         logging.info(f"DEBUG: self.use_gat evaluated to: {self.use_gat}")
 
-        if not self.use_gat:
-            logging.info(f"DEBUG: Overwriting self.gat_layer with nn.Identity because self.use_gat is False.")
-            self.gat_layer = nn.Identity()
-            
-        logging.info(f"DEBUG: Final type of self.gat_layer: {type(self.gat_layer)}") 
-
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
         obs = torch.from_numpy(obs).float().transpose(0, 1)
@@ -226,12 +225,11 @@ class NCMultiAgentPolicy(Policy):
         self.loss.backward()
         if summary_writer is not None:
             self._update_tensorboard(summary_writer, global_step)
-            if self.use_gat and self.latest_attention_scores is not None:
-                mask = self.adj.to(self.latest_attention_scores.device) > 0
-                scores = self.latest_attention_scores[mask]
-                if scores.numel() > 0:
-                    summary_writer.add_histogram('GAT/attention_scores', scores.cpu().numpy(), global_step)
-                self.latest_attention_scores = None
+        # return scalar losses for logging
+        return (self.policy_loss,
+                self.value_loss,
+                self.entropy_loss,
+                self.loss)
 
     def forward(self, ob, done, fp, action=None, out_type='p'):
         ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float()
@@ -323,15 +321,38 @@ class NCMultiAgentPolicy(Policy):
         self.na_ls_ls = []
         self.n_n_ls = []
         
-        # configure GAT dropout from config
-        gat_dropout_init = 0.1
+        # replace multi‐head GraphAttention with PyG GATConv
+        self.gat_num_heads = self.model_config.getint('gat_num_heads', 8) if self.model_config else 8
+        gat_input_dim = 3 * self.n_fc
+        assert gat_input_dim % self.gat_num_heads == 0, \
+            f"GAT input dim ({gat_input_dim}) not divisible by num_heads ({self.gat_num_heads})"
+        gat_dropout_init = self.model_config.getfloat('gat_dropout_init', 0.2) if self.model_config else 0.1
+        # single GATConv: concat multi‐heads internally
+        self.gat_layer = GATConv(
+            in_channels=gat_input_dim,
+            out_channels=gat_input_dim // self.gat_num_heads,
+            heads=self.gat_num_heads,
+            concat=True,
+            dropout=gat_dropout_init
+        )
+        # build and register edge_index buffer from neighbor_mask
+        adj_matrix = torch.tensor(self.neighbor_mask, dtype=torch.float32)
+        adj_matrix = adj_matrix + torch.eye(adj_matrix.size(0), dtype=torch.float32)
+        edge_index = adj_matrix.nonzero(as_tuple=False).t().contiguous()
+        self.register_buffer('edge_index', edge_index.long())
+
+        # read layer‐norm and residual flags from config
+        self.use_layer_norm = True
+        self.use_residual   = True
         if self.model_config:
-            # fallback to 0.2 if key missing
-            gat_dropout_init = self.model_config.getfloat('gat_dropout_init', 0.2)
-        self.gat_layer = GraphAttention(3 * self.n_fc, 3 * self.n_fc,
-                                        dropout=gat_dropout_init, alpha=0.2)
-        self.adj = torch.tensor(self.neighbor_mask, dtype=torch.float32)
-        self.adj = self.adj + torch.eye(self.adj.size(0), dtype=self.adj.dtype)
+            self.use_layer_norm = self.model_config.getboolean('gat_use_layer_norm', True)
+            self.use_residual   = self.model_config.getboolean('gat_use_residual',   True)
+        # initialize Pre‐Norm for GAT
+        if self.use_layer_norm:
+            self.pre_gat_ln    = nn.LayerNorm(3 * self.n_fc)
+        # add GAT multi‐head output projection
+        self.gat_output_projection = nn.Linear(3 * self.n_fc, 3 * self.n_fc, bias=False)
+        nn.init.xavier_uniform_(self.gat_output_projection.weight.data, gain=1.414)
         
         for i in range(self.n_agent):
             n_n, n_ns, n_na, ns_ls, na_ls = self._get_neighbor_dim(i)
@@ -391,14 +412,27 @@ class NCMultiAgentPolicy(Policy):
                 s_list.append(s.squeeze(0))
             
             s_all = torch.stack(s_list, dim=0)
-            adj = self.adj.to(x.device)
-            
-            if self.use_gat:
-                s_all, attention_scores = self.gat_layer(s_all, adj)
-                self.latest_attention_scores = attention_scores.detach()
-            else:
+
+            # preserve original features for residual
+            s_all_input = s_all
+
+            if self.use_gat and hasattr(self, 'gat_layer'):
+                # Pre‐Norm
+                s_block_input = s_all_input
+                s_input_for_gat = self.pre_gat_ln(s_block_input) if (self.use_layer_norm and hasattr(self, 'pre_gat_ln')) else s_block_input
+                # single PyG GATConv
+                s_after = self.gat_layer(s_input_for_gat, self.edge_index)
+                s_proj = self.gat_output_projection(s_after) if hasattr(self, 'gat_output_projection') else s_after
+                self.latest_attention_scores = None  # attention extraction not yet handled
+                # Residual
+                s_all = (s_block_input + s_proj) if self.use_residual else s_proj
+            elif not self.use_gat:
                 self.latest_attention_scores = None
-                s_all = self.gat_layer(s_all)
+                s_all = s_all_input
+            else:
+                logging.error("GAT intended but gat_layer not properly initialized.")
+                self.latest_attention_scores = None
+                s_all = s_all_input
             
             for i in range(self.n_agent):
                 s_i = s_all[i].unsqueeze(0)

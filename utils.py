@@ -9,7 +9,9 @@ import subprocess
 import copy
 from queue import PriorityQueue
 import sys # Import sys for StreamHandler
-from agents.gat import GraphAttention
+import io   # for UTF-8 wrapper
+import torch
+import torch.nn as nn
 
 
 def check_dir(cur_dir):
@@ -52,12 +54,13 @@ def init_log(log_file=None):
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    # Set basic config - this sets up a StreamHandler directed to stdout
-    logging.basicConfig(
-        level=log_level,
-        format=log_format,
-        stream=sys.stdout # Explicitly set stream to stdout
-    )
+    # manual handler for UTF-8-safe console output
+    root = logging.getLogger()
+    root.setLevel(log_level)
+    utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", write_through=True)
+    sh = logging.StreamHandler(stream=utf8_stdout)
+    sh.setFormatter(logging.Formatter(log_format))
+    root.addHandler(sh)
 
     # Ensure FileHandler remains commented out/inactive
     # if log_file:
@@ -67,7 +70,6 @@ def init_log(log_file=None):
 
     # Log the configuration (optional, kept for consistency)
     if log_file:
-        # This part will not be reached if log_file is None, but kept for structure
         logging.info(f"Logging configured. Level: {logging.getLevelName(log_level)}. Outputting to Console and File: {log_file}")
     else:
         logging.info(f"Logging configured. Level: {logging.getLevelName(log_level)}. Outputting to Console (stdout).")
@@ -240,7 +242,7 @@ class Trainer():
             value = self.model.forward(ob, done, self.naction, 'v')
         return value
 
-    def _log_episode(self, global_step, mean_reward, std_reward):
+    def _log_episode(self, global_step, mean_reward, std_reward, env_stats=None):
         log = {'agent': self.agent,
                'step': global_step,
                'test_id': -1,
@@ -248,7 +250,12 @@ class Trainer():
                'std_reward': std_reward}
         self.data.append(log)
         self._add_summary(mean_reward, global_step)
-        self.summary_writer.flush()
+        if self.summary_writer:
+            self.summary_writer.add_scalar('Perf/EpisodeReward_Std', std_reward, global_step=global_step)
+            if env_stats:
+                for key, value in env_stats.items():
+                    self.summary_writer.add_scalar(f'Perf/{key}', value, global_step=global_step)
+            self.summary_writer.flush()
     #Interacting with the env and collect experiences
 
     def collect_agent_metrics(self, next_ob, reward):
@@ -363,20 +370,28 @@ class Trainer():
             self.model.reset()
             self.cur_step = 0 #此episode的step設為0 
             self.episode_rewards = [] #Reward會被存在這個list中
+            # ensure env_stats exists even if try block continues or errors
+            env_stats = {}
             try:
                 while True: #這個while是以episode為單位，一個episode就是一次模擬從頭到尾的過程
                     # --- dynamic GAT dropout update Start ---
                     current_step = self.global_counter.cur_step
-                    if current_step < self.gat_dropout_decay_steps:
-                        frac = current_step / self.gat_dropout_decay_steps
-                        current_gat_dropout = self.gat_dropout_init - (self.gat_dropout_init - self.gat_dropout_final) * frac
+                    total_decay_steps = self.gat_dropout_decay_steps
+                    init_val = self.gat_dropout_init
+                    final_val = self.gat_dropout_final
+
+                    if current_step < total_decay_steps:
+                        cosine_decay = 0.5 * (1 + np.cos(np.pi * current_step / total_decay_steps))
+                        current_gat_dropout = final_val + (init_val - final_val) * cosine_decay
                     else:
-                        current_gat_dropout = self.gat_dropout_final
-                    current_gat_dropout = max(self.gat_dropout_final, current_gat_dropout)
-                    if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'gat_layer'):
-                        from agents.gat import GraphAttention
-                        if isinstance(self.model.policy.gat_layer, GraphAttention):
-                            self.model.policy.gat_layer.dropout = current_gat_dropout
+                        current_gat_dropout = final_val
+
+                    current_gat_dropout = max(final_val, float(current_gat_dropout))  # ensure float and not below final_val
+
+                    # 更新 PyG GATConv 層的 dropout 率
+                    if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'gat_layer') \
+                            and hasattr(self.model.policy.gat_layer, 'dropout'):
+                        self.model.policy.gat_layer.dropout = float(current_gat_dropout)
                     if self.summary_writer and (current_step % self.global_counter.log_step == 0):
                         self.summary_writer.add_scalar('train/gat_dropout', current_gat_dropout, current_step)
 
@@ -398,39 +413,42 @@ class Trainer():
                     global_step = self.global_counter.cur_step
                     logging.debug(f"step: {global_step}")
 
-                    # Assume model.backward now returns losses
-                    losses = self.model.backward(R, dt) # Pass only necessary args
-
-                    # Log losses and other metrics after backward pass
-                    if losses: # Check if backward returned losses
-                        policy_loss, value_loss, entropy_loss, total_loss = losses
-                        self.summary_writer.add_scalar('loss/policy', policy_loss.item(), global_step)
-                        self.summary_writer.add_scalar('loss/value', value_loss.item(), global_step)
-                        self.summary_writer.add_scalar('loss/entropy', entropy_loss.item(), global_step)
-                        self.summary_writer.add_scalar('loss/total', total_loss.item(), global_step)
-
-                        # Log learning rate (assuming self.model.optimizer exists)
-                        if hasattr(self.model, 'optimizer') and self.model.optimizer:
-                            self.summary_writer.add_scalar('train/learning_rate', self.model.optimizer.param_groups[0]['lr'], global_step)
-
-                        # Log gradient norm (assuming self.model.parameters() gives trainable params)
-                        total_norm = 0
-                        for p in self.model.parameters():
-                            if p.grad is not None:
-                                param_norm = p.grad.data.norm(2)
-                                total_norm += param_norm.item() ** 2
-                        total_norm = total_norm ** 0.5
-                        self.summary_writer.add_scalar('train/grad_norm', total_norm, global_step)
-
-                        # periodically flush TensorBoard writer
-                        if global_step % 50 == 0 and self.summary_writer is not None:
-                            self.summary_writer.flush()
+                    # --- after explore, compute losses ---
+                    losses_tuple = self.model.backward(R, dt)
+                    if losses_tuple:
+                        if len(losses_tuple) == 4:  # expect basic losses
+                            policy_loss, value_loss, entropy_loss, total_loss = losses_tuple
+                            self.summary_writer.add_scalar('loss/policy', policy_loss.item(), global_step)
+                            self.summary_writer.add_scalar('loss/value', value_loss.item(), global_step)
+                            self.summary_writer.add_scalar('loss/entropy', entropy_loss.item(), global_step)
+                            self.summary_writer.add_scalar('loss/total', total_loss.item(), global_step)
+                            # learning rate
+                            if hasattr(self.model, 'optimizer') and self.model.optimizer:
+                                self.summary_writer.add_scalar(
+                                    'train/learning_rate',
+                                    self.model.optimizer.param_groups[0]['lr'],
+                                    global_step)
+                            # gradient norm
+                            total_norm = 0
+                            for p in self.model.policy.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2)
+                                    total_norm += param_norm.item() ** 2
+                            total_norm = total_norm ** 0.5
+                            self.summary_writer.add_scalar('train/grad_norm', total_norm, global_step)
+                            # flush occasionally
+                            if global_step % 50 == 0:
+                                self.summary_writer.flush()
+                        else:
+                            logging.error(f"Step {global_step}: model.backward() returned {len(losses_tuple)} values, expected 4 for current test.")
 
                     # termination
                     if done:
                         self.env.terminate()
-                        # pytorch implementation is faster, wait SUMO for 1s
                         time.sleep(1)
+                        # collect environment statistics for this episode
+                        env_stats = self.env.get_episode_statistics() \
+                            if hasattr(self.env, 'get_episode_statistics') else {}
                         break
             except Exception as e:
                 logging.exception("An error occurred during run()")
@@ -445,7 +463,7 @@ class Trainer():
                 self.env.train_mode = False
                 mean_reward, std_reward = self.perform(-1)
                 self.env.train_mode = True
-            self._log_episode(global_step, mean_reward, std_reward)
+            self._log_episode(global_step, mean_reward, std_reward, env_stats)
 
         df = pd.DataFrame(self.data)
         df.to_csv(self.output_path + 'train_reward.csv')
