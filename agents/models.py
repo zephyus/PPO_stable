@@ -34,19 +34,15 @@ class IA2C:
         if self.reward_clip > 0:
             reward = np.clip(reward, -self.reward_clip, self.reward_clip)
         for i in range(self.n_agent):
-            agent_lstm_state = lstm_state_rollout[i] if isinstance(lstm_state_rollout, np.ndarray) and lstm_state_rollout.ndim > 1 else lstm_state_rollout
-
             self.trans_buffer[i].add_transition(
                 ob[i],                  # local observation
                 naction[i],             # neighbor action (fingerprint) if any
                 action[i],              # chosen action
-                reward,                 # scalar reward (can be global or per-agent, IA2C typically uses global or per-agent scalar)
+                reward if np.isscalar(reward) else reward[i], # reward can be scalar (global) or per-agent
                 value[i],               # V_old(s_t)
-                done,                   # done flag
-                log_prob[i],            # log π_old(a_t|s_t)
-                agent_lstm_state        # (h,c) before this step for agent i
+                done if np.isscalar(done) else done[i] # done can be scalar (global) or per-agent
             )
-    #重點看一下backward他到底要看哪些東西
+
     def backward(self, Rends, dt, summary_writer=None, global_step=None):
         self.optimizer.zero_grad()
         losses_to_return = None
@@ -240,7 +236,7 @@ class IA2C:
         self.trans_buffer = []
         for i in range(self.n_agent):
             # init replay buffer
-            self.trans_buffer.append(OnPolicyBuffer(gamma, coop_gamma, distance_mask[i]))
+            self.trans_buffer.append(OnPolicyBuffer(gamma, coop_gamma, distance_mask[i], self.n_step))
 
     def _update_lr(self, global_step):  # add global_step parameter
         # TODO: refactor this using optim.lr_scheduler
@@ -319,10 +315,16 @@ class MA2C_NC(IA2C):
 
     def backward(self, Rends, dt, summary_writer=None, global_step=None):
         self.optimizer.zero_grad()
-        obs, ps, acts, dones, Rs, Advs = self.trans_buffer.sample_transition(Rends, dt)
-        # capture losses from multi-agent policy backward
+        # sample_transition returns: (obs, actions, old_logps, dones, returns,
+        #                        advantages, old_values, fps, lstm_states)
+        # Corrected unpacking:
+        obs, acts, _, dones, Rs, Advs, _, fps, _ = \
+            self.trans_buffer.sample_transition(Rends, dt)
+        
+        # The call to policy.backward uses the correctly unpacked 'fps' and 'acts'.
+        # policy.backward expects (obs, fps, acts, dones, Rs, Advs, ...)
         policy_loss, value_loss, entropy_loss, total_loss = \
-            self.policy.backward(obs, ps, acts, dones, Rs, Advs,
+            self.policy.backward(obs, fps, acts, dones, Rs, Advs,
                                  self.e_coef, self.v_coef,
                                  summary_writer=summary_writer, global_step=global_step)
         if self.max_grad_norm > 0:
@@ -471,16 +473,20 @@ class MA2PPO_NC(MA2C_NC):
 
     def update(self, R_bootstrap_agents, dt, summary_writer=None, global_step=None):
         # sample rollout from buffer (now returns fps and lstm_states)
+        # Expects (T, N, ...) format from sample_transition
         obs, actions, old_logps, dones, returns, advs, old_values, fps, lstm_states = \
             self.trans_buffer.sample_transition(R_bootstrap_agents, dt)
 
         device = self.policy.device
-        n_agents, T, obs_dim = obs.shape
-
+        
         # --- handle empty rollout ---
-        if T == 0:
+        if obs.shape[0] == 0: # Check if T (first dimension) is 0
             logging.warning(f"[{self.name}] Empty rollout buffer at step {global_step}, skipping update.")
             return 0.0, 0.0, 0.0, 0.0
+
+        # obs is (T, N, obs_dim), actions is (T,N) etc.
+        T = obs.shape[0] 
+        # n_agents = obs.shape[1] # Not directly used here, but good to note
 
         # --- compute minibatch size safely (Fatal Error #4 fix) ---
         # ensure positive num_minibatches
@@ -498,18 +504,16 @@ class MA2PPO_NC(MA2C_NC):
             mb_size = 1
             logging.warning(f"[{self.name}] mb_size computed as 0; forcing mb_size=1.")
 
-        # transpose fps to time-major: (T, n_agents, fp_dim)
-        fps_tm = torch.from_numpy(fps.transpose(1,0,2)).to(device).float()
-        # transpose lstm_states to time-major: (T, n_agents, H*2)
-        lstm_states_tm = torch.from_numpy(lstm_states.transpose(1,0,2)).to(device).float()
+        # Patch-03: Remove transpositions. Data from buffer is already (T, N, ...)
+        obs_tm   = torch.from_numpy(obs).to(device).float()
+        fps_tm   = torch.from_numpy(fps).to(device).float()
+        lstm_states_tm = torch.from_numpy(lstm_states).to(device).float()
+        act_tm   = torch.from_numpy(actions).to(device).long()
+        oldlp_tm = torch.from_numpy(old_logps).to(device).float()
+        ret_tm   = torch.from_numpy(returns).to(device).float()
+        adv_tm   = torch.from_numpy(advs).to(device).float()
+        val_tm   = torch.from_numpy(old_values).to(device).float()
 
-        # ...transpose obs/actions/etc as before...
-        obs_tm   = torch.from_numpy(obs.transpose(1,0,2)).to(device).float()
-        act_tm   = torch.from_numpy(actions.transpose(1,0)).to(device).long()
-        oldlp_tm = torch.from_numpy(old_logps.transpose(1,0)).to(device).float()
-        ret_tm   = torch.from_numpy(returns.transpose(1,0)).to(device).float()
-        adv_tm   = torch.from_numpy(advs.transpose(1,0)).to(device).float()
-        val_tm   = torch.from_numpy(old_values.transpose(1,0)).to(device).float()
 
         if self.normalize_advantage:
             adv_tm = (adv_tm - adv_tm.mean()) / (adv_tm.std() + 1e-8)
@@ -521,19 +525,24 @@ class MA2PPO_NC(MA2C_NC):
             idx_perm = torch.randperm(total_steps, device=device)
             for start in range(0, total_steps, mb_size):
                 mb_idx = idx_perm[start:start+mb_size]
-                mb_obs    = obs_tm[mb_idx]    # (mb, n_agents, obs_dim)
-                mb_fps    = fps_tm[mb_idx]    # (mb, n_agents, fp_dim)
+                mb_obs    = obs_tm[mb_idx]    # (mb_size, N, obs_dim)
+                mb_fps    = fps_tm[mb_idx]    # (mb_size, N, fp_dim)
                 mb_act    = act_tm[mb_idx]
                 mb_oldlp  = oldlp_tm[mb_idx]
                 mb_ret    = ret_tm[mb_idx]
                 mb_adv    = adv_tm[mb_idx]
                 mb_val    = val_tm[mb_idx]
-                mb_lstm_states = lstm_states_tm[mb_idx] # Slice LSTM states for minibatch
+                mb_lstm_states = lstm_states_tm[mb_idx] # Slice LSTM states for minibatch (mb_size, N, 2H)
 
+                # Patch M: Vectorized call to policy evaluation
                 newlp, newv, ent = self.policy.evaluate_actions_values_and_entropy(
-                    mb_obs, mb_fps, mb_act,
-                    initial_lstm_states_batch=mb_lstm_states # Pass LSTM states
+                    mb_obs,          # (mb_size, N, obs_dim)
+                    mb_fps,          # (mb_size, N, fp_dim)
+                    mb_act,          # (mb_size, N)
+                    mb_lstm_states   # (mb_size, N, 2H)
                 )
+                # newlp, newv, ent are expected to be (mb_size, N)
+                
                 ratio = torch.exp(newlp - mb_oldlp.detach())
                 surr1 = ratio * mb_adv.detach()
                 surr2 = torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon) * mb_adv.detach()

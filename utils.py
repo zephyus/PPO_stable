@@ -170,6 +170,30 @@ class Trainer():
             self.gat_dropout_final = 0.1
             self.gat_dropout_decay_steps = 500000
 
+    def _log_episode(self, global_step, mean_reward, std_reward, env_stats):
+        """
+        Log episode-level statistics to console / TensorBoard.
+
+        Args
+        ----
+        global_step : int              current environment step
+        mean_reward : float | np.array mean episode reward
+        std_reward  : float | np.array std of episode reward
+        env_stats   : dict             any extra stats collected from env
+        """
+        if hasattr(self, 'summary_writer') and self.summary_writer is not None:
+            self.summary_writer.add_scalar('episode/mean_reward', mean_reward, global_step)
+            self.summary_writer.add_scalar('episode/std_reward',  std_reward,  global_step)
+            # write additional environment stats if provided
+            if isinstance(env_stats, dict):
+                for k, v in env_stats.items():
+                    self.summary_writer.add_scalar(f'episode/{k}', v, global_step)
+
+        # 可選：印到 console 或 logging
+        logging.info(f"[Ep @ step {global_step}]  "
+                     f"meanR={mean_reward:.3f} ± {std_reward:.3f}  "
+                     + " ".join([f"{k}={v:.3f}" for k, v in (env_stats or {}).items()]))
+
     def _add_summary(self, reward, global_step, is_train=True):
         if is_train:
             self.summary_writer.add_scalar('train_reward', reward, global_step=global_step)
@@ -211,10 +235,21 @@ class Trainer():
                 logp_np[i]      = dist.log_prob(a_i).item()
                 values_np[i]    = value_list[i].item()
                 env_probs[i]    = probs_list[i].squeeze().cpu().detach().numpy()
+        elif self.agent.startswith('mappo'):
+            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
+            for i in range(n):
+                dist = torch.distributions.Categorical(logits=logits_list[i])
+                if mode == 'train':
+                    a_i = dist.sample()
+                else:
+                    a_i = torch.argmax(logits_list[i], dim=-1)
+                actions_np[i] = a_i.item()
+                logp_np[i]   = dist.log_prob(a_i).item()
+                values_np[i] = value_list[i].item()
+                env_probs[i] = probs_list[i].squeeze().cpu().detach().numpy()
         elif self.agent=='greedy':
             a = self.model.forward(ob)
             actions_np[:] = np.array(a)
-            # no logp/value for greedy
         else:
             raise NotImplementedError(self.agent)
 
@@ -321,9 +356,29 @@ class Trainer():
                     current_gat_dropout = max(final_val, float(current_gat_dropout))  # ensure float and not below final_val
 
                     # 更新 PyG GATConv 層的 dropout 率
-                    if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'gat_layer') \
-                            and hasattr(self.model.policy.gat_layer, 'dropout'):
-                        self.model.policy.gat_layer.dropout = float(current_gat_dropout)
+                    if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'gat_layer'):
+                        gat_conv_layer = self.model.policy.gat_layer
+                        new_dropout_rate = float(current_gat_dropout)
+
+                        # 優先嘗試設置 dropout_p (PyG >= 2.0.3 常用)
+                        if hasattr(gat_conv_layer, 'dropout_p'):
+                            gat_conv_layer.dropout_p = new_dropout_rate
+                        elif hasattr(gat_conv_layer, 'dropout'): # 兼容舊版或某些實現的 .dropout 屬性
+                            # GATConv 初始化時的 dropout 參數本身就是 p，內部可能存為 self.dropout
+                            gat_conv_layer.dropout = new_dropout_rate 
+                        else:
+                            # 作為最後手段，嘗試修改內部 _dropout (不推薦，但為了覆蓋舊版本)
+                            # 注意：PyG 不同版本內部實現可能有差異，直接訪問內部變數 _dropout 風險較高
+                            try:
+                                # PyG GATConv stores dropout probability as self.dropout, which is then used by F.dropout
+                                # If neither dropout_p nor dropout (as a direct setter) works,
+                                # this attempts to modify the stored probability.
+                                # For many PyG versions, self.dropout is the parameter passed to F.dropout.
+                                gat_conv_layer._dropout = new_dropout_rate 
+                                logging.debug(f"Set GATConv internal _dropout to {new_dropout_rate}")
+                            except AttributeError:
+                                logging.warning(f"Could not set dropout for GATConv layer {type(gat_conv_layer)}. Tried 'dropout_p', 'dropout', and '_dropout'.")
+                                
                     if self.summary_writer and (current_step % self.global_counter.log_step == 0):
                         self.summary_writer.add_scalar('train/gat_dropout', current_gat_dropout, current_step)
 
