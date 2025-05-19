@@ -207,17 +207,30 @@ class MultiAgentOnPolicyBuffer:
         fps_arr = np.stack(self.fps, axis=0).astype(np.float32)
         actions_arr = np.stack(self.actions, axis=0).astype(np.int32)
         rewards_arr = np.stack(self.rewards, axis=0).astype(np.float32)
+        # -------------------------------------------------------------------
+        # [Patch A] 若環境只回傳 scalar reward，需展開成 (T,N) 以免後續
+        #           空間獎勵／GAE 計算維度錯位。
+        #           必須先推斷 agent 數 `N_agents`，再做 repeat，避免 NameError。
+        # -------------------------------------------------------------------
+        if rewards_arr.ndim == 1:            # (T,) → (T,N)
+            N_agents = self.distance_mask.shape[0]   # = number of agents
+            rewards_arr = np.repeat(rewards_arr[:, None], N_agents, axis=1)
         values_arr = np.stack(self.values, axis=0).astype(np.float32)
         dones_arr_scalar_per_step = np.array(self.dones, dtype=bool)
 
         T, N = rewards_arr.shape[0], rewards_arr.shape[1]
 
-        if dones_arr_scalar_per_step.ndim == 1:  # Global done signal per step
-            dones_arr = np.repeat(dones_arr_scalar_per_step[:, np.newaxis], N, axis=1).astype(bool)
-        elif dones_arr_scalar_per_step.ndim == 2 and dones_arr_scalar_per_step.shape[1] == N:  # Per-agent done
+        # -------------------------------------------------------------------
+        # [Patch B] 同理，done 旗標亦須正確展開到 (T,N)
+        # -------------------------------------------------------------------
+        if dones_arr_scalar_per_step.ndim == 1:
+            dones_arr = np.repeat(dones_arr_scalar_per_step[:, None], N, axis=1).astype(bool)
+        elif dones_arr_scalar_per_step.shape == (T, N):
             dones_arr = dones_arr_scalar_per_step.astype(bool)
         else:
-            raise ValueError(f"Dones array shape {dones_arr_scalar_per_step.shape} is incompatible with T={T}, N={N}")
+            raise ValueError(
+                f"Dones array shape {dones_arr_scalar_per_step.shape} incompatible with T={T}, N={N}"
+            )
 
         log_probs_arr = np.stack(self.log_probs, axis=0).astype(np.float32)
         lstm_states_arr = np.stack(self.lstm_states, axis=0).astype(np.float32)
@@ -235,12 +248,32 @@ class MultiAgentOnPolicyBuffer:
 
             # Normalize row-wise: sum_j W_normalized[i,j] = 1 for each i
             # weights_sum_per_agent[i] = sum_j weights_unnormalized[i,j]
-            weights_sum_per_agent = weights_unnormalized.sum(axis=1, keepdims=True)  # Shape (N, 1)
+            weights_sum_per_agent = weights_unnormalized.sum(axis=1, keepdims=True)  # (N,1)
 
-            W_normalized = np.divide(weights_unnormalized, weights_sum_per_agent,
-                                     out=np.zeros_like(weights_unnormalized),
-                                     where=weights_sum_per_agent != 0)
-            # W_normalized[i,j] is the normalized weight of agent j's reward on agent i's effective reward.
+            # 先做除法，但若 row-sum 為 0 會保留 0；稍後再處理
+            W_normalized = np.divide(
+                weights_unnormalized,
+                weights_sum_per_agent,
+                out=np.zeros_like(weights_unnormalized),
+                where=weights_sum_per_agent != 0,
+            )
+
+            # 若某行全 0，代表該 agent 沒有可用鄰居（或距離全超過門檻），
+            # 為避免 r_eff 被歸零，fallback：讓自己權重 = 1
+            zero_row_mask = (weights_sum_per_agent.squeeze(-1) == 0)
+            if np.any(zero_row_mask):
+                W_normalized[zero_row_mask, :] = 0.0
+                # Set diagonal to 1 for agents with no other weighted neighbors
+                # This ensures they consider their own reward.
+                # Need to be careful if W_normalized was already modified.
+                # A cleaner way for isolated agents:
+                # W_normalized[zero_row_mask, np.arange(N)[zero_row_mask]] = 1.0
+                # However, the original patch uses fill_diagonal on the potentially modified W_normalized.
+                # For safety and to match the patch, we'll assume W_normalized was zeroed out for these rows first.
+                # Create an identity matrix for the zero_row_mask indices
+                identity_for_isolated = np.eye(N)[zero_row_mask]
+                W_normalized[zero_row_mask] = identity_for_isolated 
+
 
             # STEP-2: Calculate Effective Reward r_eff_arr (T, N)
             neighbor_weighted_rewards = np.matmul(rewards_arr, W_normalized.T)  # (T,N) @ (N,N) -> (T,N)
@@ -257,12 +290,22 @@ class MultiAgentOnPolicyBuffer:
             current_rewards_t = rewards_for_gae[t]
             current_values_t = values_arr[t]
 
-            actual_next_values = R_bootstrap_agents if t == T - 1 else values_arr[t + 1]
-            done_after_current_step = dones_arr[t]
+            # ----------------------------------------------------------------
+            # [Patch C] 正確處理「episode 中提早終止」的 bootstrap：
+            #           - 若當前 step 已終止，下一 V 值必須歸零
+            # ----------------------------------------------------------------
+            if t == T - 1:
+                # R_bootstrap_agents 可能是 scalar 或 (N,)
+                next_vals_t = R_bootstrap_agents
+                if np.ndim(next_vals_t) == 0:
+                    next_vals_t = np.full(N, next_vals_t, dtype=np.float32)
+            else:
+                next_vals_t = values_arr[t + 1]
 
-            next_non_terminal = 1.0 - done_after_current_step.astype(np.float32)
+            next_non_terminal = 1.0 - dones_arr[t].astype(np.float32)
+            next_vals_t = next_vals_t * next_non_terminal
 
-            delta = current_rewards_t + self.gamma * actual_next_values * next_non_terminal - current_values_t
+            delta = rewards_for_gae[t] + self.gamma * next_vals_t - values_arr[t]
             advantages[t] = last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
 
         returns_arr = advantages + values_arr

@@ -304,29 +304,104 @@ class NCMultiAgentPolicy(Policy):
 
         return actor_logits_squeezed, value_list_squeezed, probs_list_N_of_A
 
-    def evaluate_actions_values_and_entropy(self, obs_batch_B_N_Do, fps_batch_B_N_Dfp,
-                                            actions_batch_B_N, initial_lstm_states_param):
+    def evaluate_actions_values_and_entropy(
+        self,
+        obs_batch,         # ≈ (B,N,Do) 但實際可能 2~4 維錯位
+        fps_batch,
+        actions_batch,
+        initial_states
+    ):
         """
-        Evaluate actions, values, and entropy for a batch of sequences.
-        Processes each item in the batch iteratively to preserve neighbor topology.
-        Returns log_probs_all (B,N), values_all (B,N), entropy_all (B,N).
+        把所有奇怪 shape 變成 (B, N_agent, Do)
         """
-        B, N, _ = obs_batch_B_N_Do.shape
-        device  = obs_batch_B_N_Do.device
+        # -------- 先統一變成 ≥3 維 --------
+        if obs_batch.ndim == 2:
+            raise ValueError("obs 只有 2 維？資料管線肯定有誤。")
 
-        # If initial_lstm_states_param is (N,2H), broadcast to (B,N,2H)
-        if initial_lstm_states_param.dim() == 2:
-            initial_lstm_states_param = (initial_lstm_states_param
+        # --- case A: 4-D，且其中一個軸 = N_agent ---
+        if obs_batch.ndim == 4:
+            # 可能是 (B,T,N,Do) 或 (T,N,B,Do)
+            axes = list(obs_batch.shape)
+            try:
+                n_idx = axes.index(self.n_agent)
+            except ValueError:
+                raise ValueError(f"4-D obs 找不到 n_agent={self.n_agent} 這一軸，"
+                                 "請檢查資料產生端。")
+
+            # 重新排列成 (B,T,N,Do)
+            if n_idx == 0:  # (N,B,T,Do) 不太可能，略
+                raise ValueError("Unexpected axis order: (N,B,T,Do)")
+            elif n_idx == 1:  # (T,N,B,Do)
+                obs_batch   = obs_batch.permute(2,0,1,3).contiguous()
+                fps_batch   = fps_batch.permute(2,0,1,3).contiguous()
+                actions_batch = actions_batch.permute(2,0,1).contiguous()
+            elif n_idx == 2:  # (B,T,N,Do) ← 最常見，無需動
+                pass
+            else:
+                # n_idx == 3 → (B,T,Do,N) 也不太合理
+                raise ValueError("Unexpected axis order with n_agent at -1")
+
+            # 取最後一個時間步 (T-1)
+            obs_batch      = obs_batch[:, -1]          # (B,N,Do)
+            fps_batch      = fps_batch[:, -1]
+            actions_batch  = actions_batch[:, -1]
+
+        # --- case B: 3-D，但先檢查是不是 (N,B,Do) / (flat_N,B,Do) ---
+        if obs_batch.ndim == 3:
+            B0, M, D = obs_batch.shape
+            N = self.n_agent
+
+            # (N,B,Do) → (B,N,Do)
+            if B0 == N and M != N:
+                obs_batch   = obs_batch.permute(1,0,2).contiguous()
+                fps_batch   = fps_batch.permute(1,0,2).contiguous()
+                actions_batch = actions_batch.permute(1,0).contiguous()
+
+            # (flat_N,B,Do) → 先換軸
+            elif obs_batch.shape[1] == self.n_agent and obs_batch.shape[0] % N == 0:
+                obs_batch   = obs_batch.permute(1,0,2).contiguous()
+                fps_batch   = fps_batch.permute(1,0,2).contiguous()
+                actions_batch = actions_batch.permute(1,0).contiguous()
+
+            # 此刻仍 3-D：(B, M, Do)
+            B, M, D = obs_batch.shape
+            if M != N:
+                if M % N != 0:
+                    raise ValueError(f"Incoming obs 2-nd dim = {M} 無法整除 n_agent={N}；"
+                                     "資料批次時間步不一致。")
+                T_seq = M // N
+                obs_batch     = obs_batch.view(B, T_seq, N, D)[:, -1]
+                fps_batch     = fps_batch.view(B, T_seq, N, -1)[:, -1]
+                actions_batch = actions_batch.view(B, T_seq, N)[:, -1]
+
+        # --- 最終確認 ---
+        B, N_final, _ = obs_batch.shape
+        assert N_final == self.n_agent, \
+            f"整理完後的 agent 維度 {N_final} ≠ n_agent={self.n_agent}"
+
+        # ==============================
+        # 以下保持不變：device、logp、value 計算…
+        device = obs_batch.device
+        # （原來那段從「If initial_lstm_states_batch.dim() == 2」開始
+        #  直到回傳 logps, values, ents 全部照舊）
+
+
+
+
+        # If initial_states is (N,2H), broadcast to (B,N,2H)
+        if initial_states.dim() == 2:
+            initial_states = (initial_states
                                          .unsqueeze(0)
                                          .expand(B, -1, -1)
                                          .contiguous())
         
-        assert initial_lstm_states_param.dim() == 3, \
-            f"initial_states must be 3D (B,N,2H) after broadcasting, got {initial_lstm_states_param.shape}"
-        assert initial_lstm_states_param.shape[0] == B, \
-            f"Batch dim of initial_states ({initial_lstm_states_param.shape[0]}) must match obs ({B})"
-        assert initial_lstm_states_param.shape[1] == N, \
-            f"Agent dim of initial_states ({initial_lstm_states_param.shape[1]}) must match obs ({N})"
+        # basic sanity checks
+        assert initial_states.dim() == 3, \
+            f"initial_states must be 3D (B,N,2H), got {initial_states.shape}"
+        assert initial_states.shape[0] == B, \
+            f"Batch dim ({initial_states.shape[0]}) ≠ obs batch ({B})"
+        assert initial_states.shape[1] == N, \
+            f"Agent dim ({initial_states.shape[1]}) ≠ obs agents ({N})"
 
 
         logps  = torch.zeros(B, N, device=device)
@@ -338,9 +413,9 @@ class NCMultiAgentPolicy(Policy):
 
         for b in range(B):
             # obs_item is (1,N,Do), fps_item is (1,N,Dfp), initial_states_item is (N,2H)
-            obs_item = obs_batch_B_N_Do[b:b+1] 
-            fps_item = fps_batch_B_N_Dfp[b:b+1]
-            initial_states_item_N_2H = initial_lstm_states_param[b]
+            obs_item = obs_batch[b:b+1] 
+            fps_item = fps_batch[b:b+1]
+            initial_states_item_N_2H = initial_states[b]
 
             # _run_comm_layers expects obs_T_N_Do, dones_T_N, fps_T_N_Dfp, initial_states_N_2H
             # Here, T (sequence length for LSTM inside _run_comm_layers) is 1.
@@ -364,7 +439,7 @@ class NCMultiAgentPolicy(Policy):
                 dist_i   = torch.distributions.Categorical(logits=logits_i_1_Ai)
 
                 # actions_batch_B_N is (B,N), so actions_batch_B_N[b,i] is a scalar action
-                action_for_agent_i = actions_batch_B_N[b, i].to(device) # scalar
+                action_for_agent_i = actions_batch[b, i].to(device) # scalar
                 
                 logps [b, i] = dist_i.log_prob(action_for_agent_i) # log_prob expects scalar or (1,)
                 ents  [b, i] = dist_i.entropy().squeeze()
@@ -377,44 +452,52 @@ class NCMultiAgentPolicy(Policy):
         device = x.device
         js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().to(device)
         m_i = torch.index_select(h, 0, js).view(1, self.n_h * n_n)
-        p_i_indexed = torch.index_select(p, 0, js) # Renamed to avoid conflict, original p_i is built below
-        nx_i_indexed = torch.index_select(x, 0, js)
+        p_i_indexed = torch.index_select(p, 0, js)
+        # ── ensure at least 1-D when Do==1 ──
+        x_src = x.unsqueeze(-1) if x.dim() == 1 else x
+        nx_i_indexed = torch.index_select(x_src, 0, js)
 
-
+        # ── unified fingerprint concatenation ──
         if self.identical:
-            # p_i for self.identical case will be p_i_indexed
-            p_i_for_projection = p_i_indexed 
-
-            nx_i = nx_i_indexed.view(1, self.n_s * n_n)
-            x_i = x[i].unsqueeze(0)
+            # flatten all neighbors into one fingerprint vector
+            p_cat_for_fc = p_i_indexed.view(1, -1)           # (1, n_n*Da)
+            nx_i         = nx_i_indexed.view(1, -1)          # (1, n_n*Do′)
+            x_i          = x_src[i].unsqueeze(0)             # (1, Do′)
         else:
-            p_i_ls = []
-            nx_i_ls = []
-            for j_loop in range(n_n): # j is already used for js
-                p_i_ls.append(p_i_indexed[j_loop].narrow(0, 0, self.na_ls_ls[i][j_loop]))
-                nx_i_ls.append(nx_i_indexed[j_loop].narrow(0, 0, self.ns_ls_ls[i][j_loop]))
-            p_i_for_projection = torch.cat(p_i_ls).unsqueeze(0) # This is the p_i to be projected
-            nx_i = torch.cat(nx_i_ls).unsqueeze(0)
-            x_i = x[i].narrow(0, 0, self.n_s_ls[i]).unsqueeze(0)
+            p_i_ls, nx_i_ls = [], []
+            for j_loop in range(n_n):
+                p_vec = p_i_indexed[j_loop]
+                if p_vec.dim() == 0: p_vec = p_vec.unsqueeze(0)
+                nx_vec = nx_i_indexed[j_loop]
+                if nx_vec.dim() == 0: nx_vec = nx_vec.unsqueeze(0)
+                p_i_ls.append(p_vec.narrow(0, 0, self.na_ls_ls[i][j_loop]))
+                nx_i_ls.append(nx_vec.narrow(0, 0, self.ns_ls_ls[i][j_loop]))
+            # build concatenated fingerprint or mark empty
+            p_cat_for_fc = (torch.cat(p_i_ls, dim=0).unsqueeze(0) 
+                            if p_i_ls else None)
+            nx_i = (torch.cat(nx_i_ls).unsqueeze(0) 
+                    if nx_i_ls else torch.zeros(1, 0, device=device))
+            x_i_raw = x_src[i]
+            if x_i_raw.dim() == 0: x_i_raw = x_i_raw.unsqueeze(0)
+            x_i = x_i_raw.narrow(0, 0, self.n_s_ls[i]).unsqueeze(0)
 
         fc_x_input = torch.cat([x_i, nx_i], dim=1)
         current_n_ns = fc_x_input.size(1)
         fc_x = self._get_fc_x(i, n_n, current_n_ns)
         s_x = F.relu(fc_x(fc_x_input))
 
-        # --- project neighbor‐policy fingerprints safely ---
-        if self.fc_p_layers[i] is not None:
-            # We want to flatten p_i_for_projection and pass it to fc_p_layers[i]
-            p_flat = p_i_for_projection.contiguous().view(1, -1).to(device)
-            if p_flat.size(1) == self.fc_p_layers[i].in_features:
-                p_proj = F.relu(self.fc_p_layers[i](p_flat))
+        # ── project fingerprints safely ──
+        if n_n > 0 and self.fc_p_layers[i] is not None and p_cat_for_fc is not None:
+            if p_cat_for_fc.size(1) == self.fc_p_layers[i].in_features:
+                p_proj = F.relu(self.fc_p_layers[i](p_cat_for_fc.to(device)))
             else:
-                # Fallback to zero vector if dimensions mismatch
                 logging.warning(
-                    f"Agent {i}: Dim mismatch for fc_p_layer. Expected {self.fc_p_layers[i].in_features}, got {p_flat.size(1)}. Using zeros."
+                    f"Agent {i}: fc_p_layer.in_features={self.fc_p_layers[i].in_features}, "
+                    f"got {p_cat_for_fc.size(1)} → zeros fallback."
                 )
                 p_proj = torch.zeros(1, self.n_fc, device=device)
         else:
+            # no neighbors or no valid fingerprint → zeros
             p_proj = torch.zeros(1, self.n_fc, device=device)
 
         # --- project neighbor hidden‐message as before (with safety for None layer) ---

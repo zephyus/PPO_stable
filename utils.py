@@ -170,30 +170,6 @@ class Trainer():
             self.gat_dropout_final = 0.1
             self.gat_dropout_decay_steps = 500000
 
-    def _log_episode(self, global_step, mean_reward, std_reward, env_stats):
-        """
-        Log episode-level statistics to console / TensorBoard.
-
-        Args
-        ----
-        global_step : int              current environment step
-        mean_reward : float | np.array mean episode reward
-        std_reward  : float | np.array std of episode reward
-        env_stats   : dict             any extra stats collected from env
-        """
-        if hasattr(self, 'summary_writer') and self.summary_writer is not None:
-            self.summary_writer.add_scalar('episode/mean_reward', mean_reward, global_step)
-            self.summary_writer.add_scalar('episode/std_reward',  std_reward,  global_step)
-            # write additional environment stats if provided
-            if isinstance(env_stats, dict):
-                for k, v in env_stats.items():
-                    self.summary_writer.add_scalar(f'episode/{k}', v, global_step)
-
-        # 可選：印到 console 或 logging
-        logging.info(f"[Ep @ step {global_step}]  "
-                     f"meanR={mean_reward:.3f} ± {std_reward:.3f}  "
-                     + " ".join([f"{k}={v:.3f}" for k, v in (env_stats or {}).items()]))
-
     def _add_summary(self, reward, global_step, is_train=True):
         if is_train:
             self.summary_writer.add_scalar('train_reward', reward, global_step=global_step)
@@ -223,38 +199,47 @@ class Trainer():
         values_np   = np.zeros(n, dtype=np.float32)
         env_probs   = [None]*n
 
-        if self.agent.startswith('ma2c'):
-            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
-            for i in range(n):
-                dist = torch.distributions.Categorical(logits=logits_list[i])
-                if mode=='train':
-                    a_i = dist.sample()
-                else:
-                    a_i = torch.argmax(logits_list[i], dim=-1)
-                actions_np[i]   = a_i.item()
-                logp_np[i]      = dist.log_prob(a_i).item()
-                values_np[i]    = value_list[i].item()
-                env_probs[i]    = probs_list[i].squeeze().cpu().detach().numpy()
-        elif self.agent.startswith('mappo'):
-            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
+        # --- START OF CRITICAL MODIFICATION for 'done' type ---
+        done_for_policy = None
+        if isinstance(done, bool): 
+            done_for_policy = np.array([done] * n, dtype=bool)
+        elif isinstance(done, (list, np.ndarray)) and hasattr(done, '__len__') and len(done) == n:
+            done_for_policy = np.asarray(done, dtype=bool)
+        elif isinstance(done, np.ndarray) and done.ndim == 0: 
+            done_for_policy = np.array([done.item()] * n, dtype=bool)
+        else:
+            logging.warning(f"Unexpected 'done' type or shape in _get_policy: {type(done)} {str(done)[:50]}. Defaulting to all False.")
+            done_for_policy = np.array([False] * n, dtype=bool)
+        # --- END OF CRITICAL MODIFICATION ---
+
+        # Check if agent is ma2c or mappo (since they share similar forward pass structure for policy)
+        if self.agent.startswith('ma2c') or self.agent.startswith('mappo'): # Ensure this covers 'mappo_nc'
+            # Pass the processed 'done_for_policy'
+            logits_list, value_list, probs_list = self.model.forward(ob, done_for_policy, fps) 
             for i in range(n):
                 dist = torch.distributions.Categorical(logits=logits_list[i])
                 if mode == 'train':
                     a_i = dist.sample()
-                else:
+                else: 
                     a_i = torch.argmax(logits_list[i], dim=-1)
                 actions_np[i] = a_i.item()
                 logp_np[i]   = dist.log_prob(a_i).item()
                 values_np[i] = value_list[i].item()
-                env_probs[i] = probs_list[i].squeeze().cpu().detach().numpy()
-        elif self.agent=='greedy':
-            a = self.model.forward(ob)
+                if probs_list and i < len(probs_list) and probs_list[i] is not None:
+                    env_probs[i] = probs_list[i].squeeze().cpu().detach().numpy()
+                else:
+                    # Handle case where probs_list might be incomplete or None for an agent
+                    env_probs[i] = np.array([]) # Or some other sensible default
+        elif self.agent == 'greedy':
+            # Assuming greedy model's forward doesn't need 'done' or 'fps' in this specific way
+            # If it does, you'd pass ob, done_for_policy, fps as appropriate
+            a = self.model.forward(ob) 
             actions_np[:] = np.array(a)
+            # logp_np and values_np remain zeros for greedy
         else:
             raise NotImplementedError(self.agent)
 
         return fps, env_probs, actions_np, logp_np, values_np
-
 
     def explore(self, prev_ob, prev_done):
         ob, done = prev_ob, prev_done

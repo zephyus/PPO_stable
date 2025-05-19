@@ -533,6 +533,14 @@ class MA2PPO_NC(MA2C_NC):
                 mb_adv    = adv_tm[mb_idx]
                 mb_val    = val_tm[mb_idx]
                 mb_lstm_states = lstm_states_tm[mb_idx] # Slice LSTM states for minibatch (mb_size, N, 2H)
+                print("__IN_FILE__", __file__)
+                import inspect
+                print("MODEL file ->", __file__)
+                print("POLICY file ->",
+                    inspect.getfile(self.policy.__class__))
+                print("POLICY eval  sig ->",
+                    inspect.signature(self.policy.evaluate_actions_values_and_entropy))
+
 
                 # Patch M: Vectorized call to policy evaluation
                 newlp, newv, ent = self.policy.evaluate_actions_values_and_entropy(
