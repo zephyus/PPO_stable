@@ -1,153 +1,239 @@
-# Networked Multi-agent RL (NMARL)
-This repo implements the state-of-the-art MARL algorithms for networked system control, with observability and communication of each agent limited to its neighborhood. For fair comparison, all algorithms are applied to A2C agents, classified into two groups: IA2C contains non-communicative policies which utilize neighborhood information only, whereas MA2C contains communicative policies with certain communication protocols.
 
-Available IA2C algorithms:
-* PolicyInferring: [Lowe, Ryan, et al. "Multi-agent actor-critic for mixed cooperative-competitive environments." Advances in Neural Information Processing Systems, 2017.](https://papers.nips.cc/paper/7217-multi-agent-actor-critic-for-mixed-cooperative-competitive-environments.pdf)
-* FingerPrint: [Foerster, Jakob, et al. "Stabilising experience replay for deep multi-agent reinforcement learning." arXiv preprint arXiv:1702.08887, 2017.](https://arxiv.org/pdf/1702.08887.pdf)
-* ConsensusUpdate: [Zhang, Kaiqing, et al. "Fully decentralized multi-agent reinforcement learning with networked agents." arXiv preprint arXiv:1802.08757, 2018.](https://arxiv.org/pdf/1802.08757.pdf)
+# Multi-Agent Proximal Policy Optimization with GAT Neighborhood Communication (0519_MAPPO)
 
+## 專案概述
 
-Available MA2C algorithms:
-* DIAL: [Foerster, Jakob, et al. "Learning to communicate with deep multi-agent reinforcement learning." Advances in Neural Information Processing Systems. 2016.](http://papers.nips.cc/paper/6042-learning-to-communicate-with-deep-multi-agent-reinforcement-learning.pdf)
-* CommNet: [Sukhbaatar, Sainbayar, et al. "Learning multiagent communication with backpropagation." Advances in Neural Information Processing Systems, 2016.](https://arxiv.org/pdf/1605.07736.pdf)
-* NeurComm: Inspired from [Gilmer, Justin, et al. "Neural message passing for quantum chemistry." arXiv preprint arXiv:1704.01212, 2017.](https://arxiv.org/pdf/1704.01212.pdf)
+本專案旨在實現並驗證一個基於近端策略優化 (PPO) 的多智能體強化學習演算法（MA2PPO_NC）。該演算法的核心特點是智能體間的鄰域通訊機制，此機制通過圖注意力網路 (GAT) 和循環神經網路 (LSTM) 實現。此外，專案還引入了空間獎勵 (Spatial Rewards) 的概念，並將其整合到廣義優勢估計 (GAE) 中，以促進智能體間的合作行為。
 
-Available NMARL scenarios:
-* ATSC Grid: Adaptive traffic signal control in a synthetic traffic grid.
-* ATSC Monaco: Adaptive traffic signal control in a real-world traffic network from Monaco city.
-* CACC Catch-up: Cooperative adaptive cruise control for catching up the leadinig vehicle.
-* CACC Slow-down: Cooperative adaptive cruise control for following the leading vehicle to slow down.
+主要組件包括：
+* **MA2PPO_NC**: 基於 PPO 的多智能體學習框架。
+* **NCMultiAgentPolicy**: 實現鄰域通訊的策略網路，可選用 GAT 進行信息聚合。
+* **MultiAgentOnPolicyBuffer**: 支持空間獎勵 GAE 計算的經驗回放緩衝區。
+* **SUMO 環境集成**: 通過 `test.py` 和相關環境類 (如 `RealNetEnv`, `SmallGridEnv` 等) 與交通模擬器 SUMO 交互 (儘管具體環境細節未完全在此次提供，但從檔案結構和 SUMO 相關設定可推斷)。
 
-## Requirements
-* Python3 == 3.5
-* [PyTorch](https://pytorch.org/get-started/locally/) == 1.4.0
-* [Tensorflow](http://www.tensorflow.org/install) == 2.1.0 (for tensorboard) 
-* [SUMO](http://sumo.dlr.de/wiki/Installing) >= 1.1.0
+## 先決條件
 
-## Usages
-First define all hyperparameters (including algorithm and DNN structure) in a config file under `[config_dir]` ([examples](./config)), and create the base directory of each experiement `[base_dir]`. For ATSC Grid, please call [`build_file.py`](./envs/large_grid_data) to generate SUMO network files before training.
+1.  **Docker**: 用於創建和管理一致的運行環境。
+2.  **NVIDIA Docker**: 如果您計劃使用 GPU (`--gpus all` 選項)，則需要安裝 NVIDIA Docker toolkit。
+3.  **預構建的 Docker 映像**: `best_environment:latest`。您需要確保此映像已經存在於您的本地 Docker 環境中。如果沒有，您需要根據項目依賴自行構建或獲取此映像。
+4.  **SUMO**: 交通模擬軟體。SUMO 需要被正確安裝，並且其路徑需要通過 `SUMO_HOME` 環境變量指定。
 
-1. To train a new agent, run
-~~~
-python3 main.py --base-dir [base_dir] train --config-dir [config_dir]
-python3 main.py --base-dir real_a1/ma2c_nclm/ --port 100 train --config-dir config/config_ma2c_nclm_net.ini
-python3 main.py --base-dir training/real/direction_aw001c06/ma2c_nclm/ --port 189 train --config-dir config/config_ma2c_nclm_net.ini
-python3 main.py --base-dir training/grid/direction_aw000c02/ma2c_nclm/ --port 110 train --config-dir config/config_ma2c_nclm_grid.ini
-~~~
-Training config/data and the trained model will be output to `[base_dir]/data` and `[base_dir]/model`, respectively.
+## 設定與安裝
 
-2. To access tensorboard during training, run
-~~~
-tensorboard --logdir=[base_dir]/log
-~~~
+以下步驟指導如何在 Docker 容器內設定和運行專案。
 
-3. To evaluate a trained agent, run
-~~~
-python3 main.py --base-dir [base_dir] evaluate --evaluation-seeds [seeds]
-~~~
-Evaluation data will be output to `[base_dir]/eva_data`. Make sure evaluation seeds are different from those used in training.    
+### 第 1 步：準備 Docker 映像 (如果尚未準備好)
+確保您擁有 `best_environment:latest` Docker 映像。此 README 不包含該映像的構建步驟。
 
-4. To visualize the agent behavior in ATSC scenarios, run
-~~~
-python3 main.py --base-dir [base_dir] evaluate --evaluation-seeds [seed] --demo
-~~~
-It is recommended to use only one evaluation seed for the demo run. This will launch the SUMO GUI, and [`view.xml`](./envs/large_grid_data) can be applied to visualize queue length and intersectin delay in edge color and thickness. 
+### 第 2 步：啟動 Docker 容器
+在您的主機終端中執行以下命令，以在背景啟動一個新的 Docker 容器。請將 `/home/russell512/my_deeprl_network_ori_test_0516_multi_head_PyG_GATCon` 替換為您主機上專案的實際路徑。
 
-## Reproducibility
-The paper results are based on an out-of-date SUMO version 0.32.0. We are re-running the experiments with SUMO 1.2.0 and will update the results soon. The pytorch impelmention is avaliable at branch [pytorch](https://github.com/cts198859/deeprl_network/tree/pytorch).
+```bash
+docker run \
+    --gpus all \
+    -d \
+    --name 0519_MAPPO_run \
+    -v /home/russell512/my_deeprl_network_ori_test_0516_multi_head_PyG_GATCon:/workspace/my_deeprl_network \
+    best_environment:latest \
+    sleep infinity
+````
 
-## Citation
-For more implementation details and underlying reasonings, please check our paper [Multi-agent Reinforcement Learning for Networked System Control](https://openreview.net/forum?id=Syx7A3NFvH).
-~~~
-@inproceedings{
-chu2020multiagent,
-title={Multi-agent Reinforcement Learning for Networked System Control},
-author={Tianshu Chu and Sandeep Chinchali and Sachin Katti},
-booktitle={International Conference on Learning Representations},
-year={2020},
-url={https://openreview.net/forum?id=Syx7A3NFvH}
-}
-~~~
+  * `--gpus all`: 分配所有可用的 GPU 給容器。如果沒有 GPU 或不想使用，可以移除此行。
+  * `-d`: 背景運行。
+  * `--name 0519_MAPPO_run`: 為容器命名，方便後續管理。
+  * `-v /path/to/your/project:/workspace/my_deeprl_network`: 將您主機上的專案目錄掛載到容器的 `/workspace/my_deeprl_network` 路徑。
 
+### 第 3 步：進入運行的容器
 
-# conda install pytorch torchvision torchaudio pytorch-cuda=11.5 -c pytorch -c nvidia
-# cd my_deeprl_network_ori
-# conda activate russ
-# conda deactivate
-# python3 test.py --base-dir training/real/direction_aw001c06/ma2c_nclm/ --port 189 train --config-dir config/config_ma2c_nclm_net.ini
-# python3 test.py --base-dir training/real/direction_aw001c06/ma2c_nclm/ --port 189 train --config-dir config/config_ma2c_nclm_net_ten_times.ini
-# run the code below
-# python3 test.py --base-dir real_a1/ma2c_nclm/ --port 189 train --config-dir config/config_ma2c_nclm_net_ten_times.ini
-# python3 test.py --base-dir /eva/ evaluate --evaluation-seeds 15
+```bash
+docker exec -it 0519_MAPPO_run /bin/bash
+```
 
+### 第 4 步：在 Docker 容器內安裝依賴 (如果映像中尚未包含)
 
---- Run on docker instructions ---
+進入 Docker 容器後，執行以下命令來安裝必要的 Python 套件和工具。
 
-#######今天遇到一台新電腦#################
-建置docker環境
-########################################
+```bash
+# 安裝基礎 RL 和 PyTorch 相關套件
+pip install traci sumolib torch tensorboard
 
-1. create folder best_environment
-2. 把 docker file 放到 best_environment
-3. docker build -t best_environment:latest .
+# 安裝 PyTorch Geometric (PyG) 及其依賴
+# 注意：以下指令針對 PyTorch 1.9.0 和 CUDA 11.1。如果您的基礎 PyTorch 版本不同，
+# 請參考 PyG 官方文件獲取對應的安裝指令。
+pip install torch-geometric
+pip install torch_scatter torch_sparse torch_cluster torch_spline_conv -f [https://data.pyg.org/whl/torch-1.9.0+cu111.html](https://data.pyg.org/whl/torch-1.9.0+cu111.html)
 
-
-#########################################
-docker 啟動!
-########################################
-
-
-cd best_environment
--
-docker run --gpus all -it -v /home/russell512/my_deeprl_network_ori_test:/workspace/my_deeprl_network best_environment:latest /bin/bash
--
-pip install traci
-pip install sumolib
-pip install torch
-cd my_deeprl_network
+# 設定 SUMO_HOME 環境變量
+# 這個路徑取決於您的 Docker 映像中 SUMO 的安裝位置。
+# 以下路徑 /root/miniconda/envs/py36/share/sumo 是一個示例，請確認其正確性。
 export SUMO_HOME="/root/miniconda/envs/py36/share/sumo"
+# 建議將此行加入容器內的 ~/.bashrc 文件，以便永久生效。
 
-
-##########################################
-進行訓練
-###########################################  nc 10次版本 #####可以正常運行
-python3 test.py --base-dir real_a1/nc_ten_times/ --port 189 train --config-dir config/config_ma2c_nc_net_ten_times.ini
-####################################
-python3 test.py --base-dir real_a1/ma2c_nclm_net_ten_times/ --port 189 train --config-dir config/config_ma2c_nclm_net_ten_times.ini
-###########################################背景
+# 安裝 tmux (用於長時間運行的會話管理)
 apt update
 apt install -y tmux
-tmux new -s mysession
-python3 test.py --base-dir real_a1/nc_ten_times_0417/ --port 189 train --config-dir config/config_ma2c_nc_net_ten_times.ini
-要離開（但讓它繼續跑）：
-Ctrl + b 然後按 d
-再次連線後，用以下指令回來：
-tmux attach -t mysession
+```
 
+**注意**: 如果 `pip install torch` 安裝的 PyTorch 版本與 PyG 依賴的 CUDA 版本不匹配，PyG 可能無法正常工作。請確保 PyTorch 版本與 PyG 的兼容性。
 
-python3 test.py --base-dir real_a1/ma2c_nclm_smallgrid/ --port 189 train --config-dir config/config_ma2c_nclm_smallgrid.ini
+## 目錄結構 (容器內 `/workspace/my_deeprl_network/`)
 
-python3 test.py --base-dir real_a1/ma2c_nc_smallgrid/ --port 189 train --config-dir config/config_ma2c_nc_smallgrid.ini
+```
+.
+├── agents/                 # 包含 RL 智能體模型 (models.py)、策略網路 (policies.py) 和工具 (utils.py for buffers)
+├── config/                 # 存放 .ini 配置文件
+├── envs/                   # 包含環境定義 (例如 small_grid_env.py)
+├── tests/                  # 單元測試 (例如 test_buffer_spatial_gae.py)
+├── utils.py                # 專案級別的工具函式和類 (如 Trainer, Counter)
+├── test.py                 # 主要的訓練和評估腳本
+└── ...                     # 其他專案文件和目錄
+```
 
-python3 test.py --base-dir real_a1/ma2c_nc_grid/ --port 189 train --config-dir config/config_ma2c_nc_grid.ini
+## 組態設定
 
-高雄專用
-python3 test.py --base-dir training/kao/thousandtimes --port 189 train --config-dir config/config_ma2c_nclm_kao.ini
+實驗的行為主要由 `.ini` 配置文件控制。主要的配置文件示例是 `config/config_mappo_nc_net_exp_0519.ini`。
 
-##########################################
-Evaluation
-###########################################
-python3 test.py --base-dir real_a1/ma2c_nclm evaluate --evaluation-seeds 2000
+關鍵配置項：
 
-###
-背景訓練 (其實到現在我(廖珈鋒)還是不會用)：
-nohup python3 test.py --base-dir real_a1/ma2c_nclm --port 189 train --config-dir config/config_ma2c_nclm_net_ten_times.ini > output.log 2>&1 &
-終止：
-ps aux | grep test.py
-kill -9 <PID>
+  * **`[ENV_CONFIG]`**:
+      * `agent`: 指定要使用的智能體/模型類型 (例如 `mappo_nc`, `ma2c_nc`)。
+      * `coop_gamma`: 合作獎勵因子 $\\alpha$，用於空間獎勵 GAE。`0.0` 表示純自私，`1.0` 表示完全納入（加權的）鄰居獎勵。
+      * `scenario`: 環境場景。
+      * `seed`: 隨機種子。
+  * **`[MODEL_CONFIG]`**:
+      * `gamma`: 折扣因子 $\\gamma$。
+      * `lr_init`: 初始學習率。
+      * `entropy_coef`: 熵獎勵係數。
+      * `value_coef`: 價值函數損失係數。
+      * `batch_size`: 訓練時的批次大小 (在 PPO 中指 rollout buffer 的大小)。
+      * **GAT 相關參數**:
+          * `gat_dropout_init`, `gat_dropout_final`, `gat_dropout_decay_steps`: GAT dropout 率的動態調整參數。
+          * `gat_num_heads`: GAT 的注意力頭數。
+          * `gat_use_layer_norm`, `gat_use_residual`: 是否在 GAT 中使用 Layer Normalization 和殘差連接。
+      * **PPO 相關超參數**:
+          * `gae_lambda`: GAE 的 $\\lambda$ 參數。
+          * `ppo_epochs`: 每個 rollout 數據用於策略更新的 epoch 數。
+          * `num_minibatches`: 每個 rollout 數據劃分成的 minibatch 數量。
+          * `clip_epsilon`: PPO 的裁剪參數 $\\epsilon$。
+  * **`[TRAIN_CONFIG]`**:
+      * `total_step`: 總訓練步數。
+      * `test_interval`: 測試間隔。
+      * `log_interval`: 日誌記錄間隔。
 
-############
-checkpoint一般來說是打不開，要用torch.load讀出來，才能知道
-到底存了啥進去，我有打一個load.py來讀，如果不見了請自己打一個
-############
+此外，環境變量 `USE_GAT` 可以控制是否在 `NCMultiAgentPolicy` 中啟用 GAT 層（`1` 為啟用，`0` 為禁用，預設為 `1`）。
+
+## 運行實驗
+
+### 訓練 MA2PPO\_NC 模型
+
+以下指令假設您已經在 Docker 容器內部，並且位於 `/workspace/my_deeprl_network/` 目錄。
+
+1.  **確保 `PYTHONPATH` (可選，通常在 Docker 中掛載正確即可)**
+    如果 Python 無法找到 `agents` 等套件，可以執行：
+
+    ```bash
+    export PYTHONPATH=$(pwd):$PYTHONPATH
+    ```
+
+2.  **啟動 `tmux` 會話 (建議用於長時間訓練)**
+
+    ```bash
+    tmux new -s training_0519_mappo
+    ```
+
+3.  **設置實驗目錄並運行訓練腳本**
+    將 `${BASE_DIR_NAME}` 替換為您希望儲存日誌和模型的相對路徑，例如 `real_a1/0519_MAPPO_run`。
+
+    ```bash
+    export BASE_DIR_NAME="real_a1/0519_MAPPO_run" # 根據您的實驗命名
+    mkdir -p ${BASE_DIR_NAME}/log
+    export USE_GAT=1 # 明確啟用 GAT (如果需要)
+
+    python3 test.py \
+        --base-dir ${BASE_DIR_NAME} \
+        --port 202 \
+        train \
+        --config-dir config/config_mappo_nc_net_exp_0519.ini \
+        > ${BASE_DIR_NAME}/log/0519_MAPPO_run_$(date +%Y%m%d_%H%M%S).log 2>&1
+    ```
+
+      * `--base-dir`: 指定實驗結果的根目錄（日誌、模型、數據等將存儲在此目錄下）。
+      * `--port`: SUMO 運行的端口號。
+      * `train`: 指定執行訓練模式。
+      * `--config-dir`: 指定所使用的配置文件。
+      * 輸出會重定向到日誌文件。
+
+4.  **從 `tmux` 會話分離**
+    按下 `Ctrl + b` 組合鍵，放開，然後馬上再按 `d` 鍵。訓練會在背景繼續運行。
+
+5.  **退出 Docker 容器**
+    在容器的命令提示符下，輸入 `exit` 並按 Enter。
+
+### 評估模型 (示例)
+
+`test.py` 腳本也支持評估模式，您可以通過 `python3 test.py evaluate --help` 查看具體參數。
+
+## 監控訓練
+
+您可以使用 TensorBoard 來監控訓練過程中的指標（如獎勵、損失函數等）。
+
+在您的**主機 (非 Docker 容器)** 上打開一個新的終端，並執行：
+
+```bash
+# 監控 real_a1 目錄下的所有實驗
+tensorboard --logdir=/home/russell512/my_deeprl_network_ori_test_0516_multi_head_PyG_GATCon/real_a1
+
+# 或者，若只想監控此特定實驗（假設 BASE_DIR_NAME 是 real_a1/0519_MAPPO_run）
+tensorboard --logdir=/home/russell512/my_deeprl_network_ori_test_0516_multi_head_PyG_GATCon/real_a1/0519_MAPPO_run
+```
+
+請將上述路徑替換為您在主機上對應的專案路徑和實驗輸出路徑。然後在瀏覽器中打開 TensorBoard 提供的 URL (通常是 `http://localhost:6006`)。
+
+## 重新連接到訓練會話
+
+如果您想查看正在運行的訓練日誌或進行其他操作：
+
+1.  **重新進入 Docker 容器**
+
+    ```bash
+    docker exec -it 0519_MAPPO_run /bin/bash
+    ```
+
+2.  **重新連接到 `tmux` 會話**
+
+    ```bash
+    tmux attach -t training_0519_mappo
+    ```
+
+    您現在可以看到訓練腳本的實時輸出。
+
+## 代碼結構概覽
+
+  * **`test.py`**: 主執行腳本，負責解析參數、初始化環境和智能體、啟動訓練或評估流程。
+  * **`utils.py`**: 包含專案級別的輔助類和函數，如 `Trainer` (負責訓練循環)、`Tester` (測試)、`Evaluator` (評估)、`Counter` (計步器)、日誌和目錄初始化工具。
+  * **`agents/utils.py`**: 包含強化學習特定工具，尤其是 `OnPolicyBuffer` 和 `MultiAgentOnPolicyBuffer` (用於經驗存儲和 GAE 計算，已實現空間獎勵 GAE)。
+  * **`agents/policies.py`**: 定義各種策略網路架構，核心是 `NCMultiAgentPolicy`，它整合了 FC 層、可選的 GAT 層和共享的 LSTM 層，以及智能體特定的 Actor/Critic 頭部。
+  * **`agents/models.py`**: 實現具体的強化學習演算法模型，如 `MA2PPO_NC`, `MA2C_NC` 等。這些模型將策略網路 (`NCMultiAgentPolicy`) 與特定的學習演算法（如 PPO 或 A2C）結合起來。
+  * **`envs/`**: 存放與特定模擬環境（如基於 SUMO 的交通環境）交互的 Python 類。
+  * **`config/`**: 存放 `.ini` 格式的配置文件，用於定義實驗的各種參數。
+
+## 單元測試
+
+專案包含單元測試，位於 `tests/` 目錄下。可以使用 `pytest` 來運行：
+
+```bash
+# 在 Docker 容器內，位於 /workspace/my_deeprl_network/ 目錄
+export PYTHONPATH=$(pwd):$PYTHONPATH # 確保能找到套件
+pytest -q tests/
+```
+
+目前已針對 `MultiAgentOnPolicyBuffer` 中的空間獎勵 GAE 實現了較為全面的單元測試。
+
+## 未來工作與優化方向
+
+  * **Phase 1 效能優化**:
+      * 將 `NCMultiAgentPolicy.evaluate_actions_values_and_entropy` 方法完全向量化，以利用 `_run_comm_layers` 的批處理能力，減少 PPO 更新時的 Python 循環開銷。
+  * **代碼清理**: 移除過時的 A2C 相關路徑（如果不再需要）、整理配置文件、更新註解。
+  * **進階效能分析**: 使用性能分析工具 (profiling) 找到潛在瓶頸。
+  * **混合精度訓練**: 探索使用混合精度訓練以加速並減少 GPU 內存佔用。
 
