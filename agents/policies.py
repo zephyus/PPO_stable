@@ -235,13 +235,18 @@ class NCMultiAgentPolicy(Policy):
         ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float()
         done = torch.from_numpy(np.expand_dims(done, axis=0)).float()
         fp = torch.from_numpy(np.expand_dims(fp, axis=0)).float()
-        h, new_states = self._run_comm_layers(ob, done, fp, self.states_fw)
-        if out_type.startswith('p'):
-            self.states_fw = new_states.detach()
-            return self._run_actor_heads(h, detach=True)
-        else:
-            action = torch.from_numpy(np.expand_dims(action, axis=1)).long()
-            return self._run_critic_heads(h, action, detach=True)
+        h_states, new_states = self._run_comm_layers(ob, done, fp, self.states_fw)
+        actor_logits = self._run_actor_heads(h_states, detach=False)
+
+        # --- use new PPO value heads ---
+        value_list = []
+        for i in range(self.n_agent):
+            v_i = self.ppo_value_heads[i](h_states[i]).squeeze(-1)
+            value_list.append(v_i)
+
+        softmax_probs = [F.softmax(l, dim=-1) for l in actor_logits]
+        self.states_fw = new_states.detach()
+        return actor_logits, value_list, softmax_probs
 
     def _get_comm_s(self, i, n_n, x, h, p):
         h = h.cuda()
@@ -317,6 +322,7 @@ class NCMultiAgentPolicy(Policy):
         self.lstm_layers = nn.ModuleList()
         self.actor_heads = nn.ModuleList()
         self.critic_heads = nn.ModuleList()
+        self.ppo_value_heads = nn.ModuleList()        # new: PPO state‐value heads
         self.ns_ls_ls = []
         self.na_ls_ls = []
         self.n_n_ls = []
@@ -364,19 +370,24 @@ class NCMultiAgentPolicy(Policy):
             self._init_actor_head(n_a)
             self._init_critic_head(n_na)
 
+            # --- NEW PPO value head for V(s_t) only ---
+            ppo_v = nn.Linear(self.n_h, 1)
+            init_layer(ppo_v, 'fc')
+            self.ppo_value_heads.append(ppo_v)
+
     def _reset(self):
         self.states_fw = torch.zeros(self.n_agent, self.n_h * 2)
         self.states_bw = torch.zeros(self.n_agent, self.n_h * 2)
 
     def _run_actor_heads(self, hs, detach=False):
-        ps = []
+        logits_list = []
         for i in range(self.n_agent):
+            logits_i = self.actor_heads[i](hs[i])
             if detach:
-                p_i = F.softmax(self.actor_heads[i](hs[i]), dim=1).squeeze().cpu().detach().numpy()
+                logits_list.append(logits_i.cpu().detach().numpy())
             else:
-                p_i = F.log_softmax(self.actor_heads[i](hs[i]), dim=1)
-            ps.append(p_i)
-        return ps
+                logits_list.append(logits_i)
+        return logits_list
 
     def _run_comm_layers(self, obs, dones, fps, states):
         obs = batch_to_seq(obs)

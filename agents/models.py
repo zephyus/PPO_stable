@@ -27,13 +27,13 @@ class IA2C:
         self._init_algo(n_s_ls, n_a_ls, neighbor_mask, distance_mask, coop_gamma,
                         total_step, seed, use_gpu, model_config)
 
-    def add_transition(self, ob, naction, action, reward, value, done):
+    def add_transition(self, ob, naction, action, reward, value, done, log_prob):
         if self.reward_norm > 0:
             reward = reward / self.reward_norm
         if self.reward_clip > 0:
             reward = np.clip(reward, -self.reward_clip, self.reward_clip)
         for i in range(self.n_agent):
-            self.trans_buffer[i].add_transition(ob[i], naction[i], action[i], reward, value[i], done)
+            self.trans_buffer[i].add_transition(ob[i], naction[i], action[i], reward, value[i], done, log_prob[i])
     #重點看一下backward他到底要看哪些東西
     def backward(self, Rends, dt, summary_writer=None, global_step=None):
         self.optimizer.zero_grad()
@@ -271,18 +271,33 @@ class MA2C_NC(IA2C):
         self._init_algo(n_s_ls, n_a_ls, neighbor_mask, distance_mask, coop_gamma,
                         total_step, seed, use_gpu, model_config)
 
-    def add_transition(self, ob, p, action, reward, value, done):
+    def add_transition(self, ob, p, action, reward, value, done, log_prob):  # added log_prob
         if self.reward_norm > 0:
             reward = reward / self.reward_norm
         if self.reward_clip > 0:
             reward = np.clip(reward, -self.reward_clip, self.reward_clip)
+
         if self.identical_agent:
-            self.trans_buffer.add_transition(np.array(ob), np.array(p), action,
-                                             reward, value, done)
+            self.trans_buffer.add_transition(
+                np.array(ob),            # observations for all agents
+                np.array(p),             # policy metadata (e.g. fingerprints)
+                np.array(action),        # actions chosen
+                np.array(reward),        # rewards
+                np.array(value),         # V_old(s_t)
+                done,                    # done flag
+                np.array(log_prob)       # log_prob_old(a_t|s_t)
+            )
         else:
             pad_ob, pad_p = self._convert_hetero_states(ob, p)
-            self.trans_buffer.add_transition(pad_ob, pad_p, action,
-                                             reward, value, done)
+            self.trans_buffer.add_transition(
+                pad_ob,
+                pad_p,
+                np.array(action),
+                np.array(reward),
+                np.array(value),
+                done,
+                np.array(log_prob)
+            )
 
     def backward(self, Rends, dt, summary_writer=None, global_step=None):
         self.optimizer.zero_grad()
@@ -412,3 +427,42 @@ class MA2C_DIAL(MA2C_NC):
                                         self.neighbor_mask, n_fc=self.n_fc, n_h=self.n_lstm,
                                         n_s_ls=self.n_s_ls, n_a_ls=self.n_a_ls, identical=False,
                                         model_config=self.model_config)
+
+
+class MA2PPO_NC(MA2C_NC):
+    def __init__(self, n_s_ls, n_a_ls, neighbor_mask, distance_mask,
+                 coop_gamma, total_step, model_config, seed=0, use_gpu=True):
+        super().__init__(n_s_ls, n_a_ls, neighbor_mask, distance_mask,
+                         coop_gamma, total_step, model_config, seed, use_gpu)
+        self.name = 'mappo_nc'
+        logging.info(f"Initializing {self.name} model.")
+
+        # PPO-specific hyperparams
+        self.gae_lambda       = model_config.getfloat('gae_lambda', 0.95)
+        self.ppo_epochs       = model_config.getint('ppo_epochs', 10)
+        self.num_minibatches  = model_config.getint('num_minibatches', 4)
+        self.clip_epsilon     = model_config.getfloat('clip_epsilon', 0.2)
+        self.value_clip_param = model_config.getfloat('value_clip_param', -1)
+        self.normalize_advantage = model_config.getboolean('normalize_advantage', True)
+
+        # re-create multi-agent buffer with GAE lambda
+        gamma = model_config.getfloat('gamma')
+        self.trans_buffer = MultiAgentOnPolicyBuffer(gamma, coop_gamma, distance_mask, self.gae_lambda)
+        logging.info(f"[{self.name}] buffer re-init with GAE λ={self.gae_lambda}")
+
+    def update(self, R_bootstrap_agents, dt, summary_writer=None, global_step=None):
+        """
+        PPO update: sample rollout, then run multi-epoch minibatch clipped objective.
+        """
+        # sample_transition returns:
+        # obs, actions, old_logps, dones, returns (V_target), advs, old_values
+        obs, actions, old_logps, dones, returns, advs, old_values = \
+            self.trans_buffer.sample_transition(R_bootstrap_agents, dt)
+
+        # convert to torch tensors and dispatch to device
+        # ... prepare data, normalize advs if required, generate minibatches ...
+
+        # multi-epoch PPO loop (stub)
+        logging.info(f"[{self.name}] update called at step {global_step}, buffer size {self.trans_buffer.size}")
+        # TODO: implement full PPO loss, minibatch loop, optimizer steps
+        return None  # placeholder

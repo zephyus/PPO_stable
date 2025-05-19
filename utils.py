@@ -191,140 +191,65 @@ class Trainer():
             return 0
 
     def _get_policy(self, ob, done, mode='train'):
+        # prepare outputs
+        n = self.env.n_agent
+        fps = self.env.get_fingerprint()  # get current fingerprint
+        actions_np  = np.zeros(n, dtype=np.int32)
+        logp_np     = np.zeros(n, dtype=np.float32)
+        values_np   = np.zeros(n, dtype=np.float32)
+        env_probs   = [None]*n
+
         if self.agent.startswith('ma2c'):
-            self.ps = self.env.get_fingerprint()
-            policy = self.model.forward(ob, done, self.ps)
-        else:
-            policy = self.model.forward(ob, done)
-
-        if self.agent == 'ma2c_nclm':
-            action = [0] * self.env.n_node
-            for i, pi in enumerate(policy):
-                # first hand
-                if i not in self.env.later_group:
-                    if mode == 'train':
-                        #訓練時，這個method會從會從policy pi中隨機抽中隨機抽，然後選成action[i] (agent i 的動作)
-                        action[i] = np.random.choice(np.arange(len(pi)), p=pi)
-                    else:
-                        #測試時，要選機率最高的
-                        action[i] = np.argmax(pi)
-
-            if self.agent.startswith('ma2c'):
-                #經過第一階段的action之後得到後續的policy
-                back_policy = self.model.forward(ob, done, self.ps, np.array(action))
-                for i, pi in enumerate(back_policy):
-                    # later move
-                    if i in self.env.later_group:
-                        policy[i] = back_policy[i]
-                        if mode == 'train':
-                            #訓練時，一樣從pi中選出一個作為action[i]
-                            action[i] = np.random.choice(np.arange(len(pi)), p=pi)
-                        else:
-                            #測試時，要選機率最高的
-                            action[i] = np.argmax(pi)
-        else:
-            action = []
-            for pi in policy:
-                if mode == 'train':
-                    action.append(np.random.choice(np.arange(len(pi)), p=pi))
+            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
+            for i in range(n):
+                dist = torch.distributions.Categorical(logits=logits_list[i])
+                if mode=='train':
+                    a_i = dist.sample()
                 else:
-                    action.append(np.argmax(pi))
-
-        return policy, np.array(action)
-
-    def _get_value(self, ob, done, action):
-        if self.agent.startswith('ma2c'):
-            value = self.model.forward(ob, done, self.ps, np.array(action), 'v')
+                    a_i = torch.argmax(logits_list[i], dim=-1)
+                actions_np[i]   = a_i.item()
+                logp_np[i]      = dist.log_prob(a_i).item()
+                values_np[i]    = value_list[i].item()
+                env_probs[i]    = probs_list[i].squeeze().cpu().detach().numpy()
+        elif self.agent=='greedy':
+            a = self.model.forward(ob)
+            actions_np[:] = np.array(a)
+            # no logp/value for greedy
         else:
-            self.naction = self.env.get_neighbor_action(action)
-            if not self.naction:
-                self.naction = np.nan
-            value = self.model.forward(ob, done, self.naction, 'v')
-        return value
+            raise NotImplementedError(self.agent)
 
-    def _log_episode(self, global_step, mean_reward, std_reward, env_stats=None):
-        log = {'agent': self.agent,
-               'step': global_step,
-               'test_id': -1,
-               'avg_reward': mean_reward,
-               'std_reward': std_reward}
-        self.data.append(log)
-        self._add_summary(mean_reward, global_step)
-        if self.summary_writer:
-            self.summary_writer.add_scalar('Perf/EpisodeReward_Std', std_reward, global_step=global_step)
-            if env_stats:
-                for key, value in env_stats.items():
-                    self.summary_writer.add_scalar(f'Perf/{key}', value, global_step=global_step)
-            self.summary_writer.flush()
-    #Interacting with the env and collect experiences
-
-    def collect_agent_metrics(self, next_ob, reward):
-        """
-        Added by Chia-Feng Liao 2025/03/19
-        Print each agent's reward and a traffic flow from next_ob[i].
-        Assumes next_ob[i] is a numeric array (wave + wait, etc.),
-        and we parse the 'wave' part as the first half of that array.
-        """
-        for i in range(self.env.n_agent):
-            agent_obs = next_ob[i]
-            if isinstance(agent_obs, (list, np.ndarray)):
-                half_len = len(agent_obs) // 2 # "ma2c_nclm" => * next_ob[i] = wave_state + signal_state
-                wave_array = agent_obs[:half_len] # take only the wave part
-                traffic_flow = float(np.sum(wave_array)) # sum because an agent contain multiple lanes
-            else:
-                traffic_flow = None
-
-            agent_reward = reward[i]
-            # print(f"[Agent={i}] Reward={agent_reward:.3f}  Flow={traffic_flow}")
+        return fps, env_probs, actions_np, logp_np, values_np
 
 
     def explore(self, prev_ob, prev_done):
-        ob = prev_ob
-        done = prev_done
+        ob, done = prev_ob, prev_done
         for _ in range(self.n_step):
-            # pre-decision <- 這步驟會拿到policy和action
-            policy, action = self._get_policy(ob, done)
-            # post-decision <- 這步驟會得到預測值，回想一下，在這裡面policy會先有一個預測分數，然後跟實際得分去做MSE
-            value = self._get_value(ob, done, action)
-            # transition
-            self.env.update_fingerprint(policy) #update_fingerprint這行我還沒研究，反正就是根據policy更新環境
-             #這行是把action丟進去env中跑，env會回傳下一階段的觀察、現在的、現在這個agent的Reward、是否結束(done)、global reward
-            next_ob, reward, done, global_reward = self.env.step(action)
+            fps, env_probs, actions_np, logp_np, values_np = self._get_policy(ob, done, mode='train')
+            self.env.update_fingerprint(env_probs)
+            next_ob, reward, done, global_reward = self.env.step(actions_np)
             self.episode_rewards.append(global_reward)
-            global_step = self.global_counter.next()
+            gs = self.global_counter.next()
             self.cur_step += 1
-            # Add by Chia-Feng Liao 2025/03/19
-            self.collect_agent_metrics(next_ob, reward) # 這其實是給我自己測試return reward的，不用理他，真的在試GAT的時候console就不用印了
-                                                        # 直接傳進GAT就可以用了
-            # collect experience
-            if self.agent.startswith('ma2c'):
-                #self.ps是從env的fingerprint中得來的，fingerprint是一個向量，這個向量紀錄其他agents的狀態還有訊息，所以current agent就
-                #可以考慮他們再下決定
-                self.model.add_transition(ob, self.ps, action, reward, value, done)
-            else:
-                self.model.add_transition(ob, self.naction, action, reward, value, done)
-            # logging
-            self.summary_writer.add_scalar('reward/global_reward', global_reward, global_step)
-            self.summary_writer.add_scalar('reward/mean_agent_reward', np.mean(reward), global_step)
 
+            # use fps from get_fingerprint, not stale self.ps
+            self.model.add_transition(ob, fps, actions_np, reward, values_np, done, logp_np)
+
+            # logging
+            self.summary_writer.add_scalar('reward/global_reward', global_reward, gs)
+            self.summary_writer.add_scalar('reward/mean_agent_reward', np.mean(reward), gs)
             if self.global_counter.should_log():
-                logging.info('''Training: global step %d, episode step %d,
-                                   ob: %s, a: %s, pi: %s, r: %.2f, train r: %.2f, done: %r''' %
-                             (global_step, self.cur_step,
-                              str(ob), str(action), str(policy), global_reward, np.mean(reward), done))
-            # terminal check must be inside batch loop for CACC env
+                logging.info(f"Step {gs} | r {global_reward:.2f} | a {actions_np} | logp {np.round(logp_np,3)} | v {np.round(values_np,3)} | done {done}")
+
             if done:
                 break
-            # 沒結束的話更新ob然後再繼續跑
             ob = next_ob
-        #這個episode結束了，所以我們直接，所以我們直接將R設成全部都0的向量
+
+        # bootstrap value for unfinished episodes
         if done:
-            R = np.zeros(self.model.n_agent)
-        #還沒結束的話，要做一次bootstrap得到結果，因爲還會有下一次
+            Rb = np.zeros(self.env.n_agent)
         else:
-            _, action = self._get_policy(ob, done)
-            R = self._get_value(ob, done, action)
-        return ob, done, R
+            _, _, _, _, Rb = self._get_policy(ob, done, mode='train')
+        return ob, done, Rb
 
     def perform(self, test_ind, gui=False):
         ob = self.env.reset(gui=gui, test_ind=test_ind)

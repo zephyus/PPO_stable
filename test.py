@@ -19,7 +19,7 @@ from envs.cacc_env import CACCEnv
 from envs.large_grid_env import LargeGridEnv
 from envs.real_net_env import RealNetEnv
 from envs.kaohsiung_env import KaoNetEnv
-from agents.models import IA2C, IA2C_FP, MA2C_NC, IA2C_CU, MA2C_CNET, MA2C_DIAL, MA2C_NCLM
+from agents.models import IA2C, IA2C_FP, MA2C_NC, IA2C_CU, MA2C_CNET, MA2C_DIAL, MA2C_NCLM, MA2PPO_NC
 from utils import (Counter, Trainer, Tester, Evaluator,
                    check_dir, copy_file, find_file,
                    init_dir, init_log, init_test_flag)
@@ -90,6 +90,9 @@ def init_agent(env, config, total_step, seed):
     elif env.agent == 'ma2c_nclm':
         return MA2C_NCLM(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
                        total_step, config, groups=env.later_group, seed=seed)
+    elif env.agent == 'mappo_nc':
+        return MA2PPO_NC(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
+                         total_step, config, seed=seed)
     else:
         return None
 
