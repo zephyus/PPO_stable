@@ -194,10 +194,13 @@ class MultiAgentOnPolicyBuffer(OnPolicyBuffer):
         adv_batch       = np.transpose(np.array(self.Advs,      dtype=np.float32), (1, 0))
         done_batch      = np.array(self.dones[:-1], dtype=np.bool)
 
+        # --- new: return fingerprint batch (fps) ---
+        fps_batch = np.transpose(np.array(self.adds, dtype=np.float32), (1, 0, 2))
+
         last_done = self.dones[-1]
         self.reset(last_done)
 
-        return obs_batch, act_batch, logp_batch, done_batch, return_batch, adv_batch, value_old_batch
+        return obs_batch, act_batch, logp_batch, done_batch, return_batch, adv_batch, value_old_batch, fps_batch
 
     def _add_st_R_Adv(self, R, dt):
         Rs = []

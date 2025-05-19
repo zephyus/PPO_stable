@@ -248,6 +248,59 @@ class NCMultiAgentPolicy(Policy):
         self.states_fw = new_states.detach()
         return actor_logits, value_list, softmax_probs
 
+    def evaluate_actions_values_and_entropy(self, obs_batch, fps_batch, actions_batch, initial_lstm_states=None):
+        """
+        Phase 0 PPO minibatch evaluation via per-sample _run_comm_layers calls.
+        Returns log_probs_all, values_all, entropy_all of shape (B, n_agents).
+        """
+        B = obs_batch.size(0)
+        device = obs_batch.device
+        n_agent = self.n_agent
+        H = self.n_h
+
+        # initial LSTM states
+        if initial_lstm_states is None:
+            init_states = torch.zeros(n_agent, H*2, device=device)
+        else:
+            init_states = initial_lstm_states
+
+        # collect hidden states per agent
+        h_batches = [[] for _ in range(n_agent)]
+        for b in range(B):
+            ob_b   = obs_batch[b:b+1]        # (1, n_agents, obs_dim)
+            fp_b   = fps_batch[b:b+1]        # (1, n_agents, fp_dim)
+            done_b = torch.zeros(1, device=device)  # assume no reset inside PPO minibatch
+
+            # single-sample forward: returns (n_agents, 1, H)
+            h_b, _ = self._run_comm_layers(ob_b, done_b, fp_b, init_states)
+            for i in range(n_agent):
+                h_batches[i].append(h_b[i])   # append (1, H)
+
+        # stack into (n_agents, B, H)
+        h_states = torch.stack([torch.cat(h_batches[i], dim=0) for i in range(n_agent)], dim=0)
+
+        # compute log_probs, values, entropy in batch
+        logp_list, val_list, ent_list = [], [], []
+        for i in range(n_agent):
+            h_i      = h_states[i]                   # (B, H)
+            logits_i = self.actor_heads[i](h_i)      # (B, n_actions)
+            val_i    = self.ppo_value_heads[i](h_i).squeeze(-1)  # (B,)
+            dist_i   = torch.distributions.Categorical(logits=logits_i)
+
+            logp_i = dist_i.log_prob(actions_batch[:, i])       # (B,)
+            ent_i  = dist_i.entropy()                            # (B,)
+
+            logp_list.append(logp_i)
+            val_list.append(val_i)
+            ent_list.append(ent_i)
+
+        # shape to (B, n_agents)
+        log_probs_all = torch.stack(logp_list, dim=1)
+        values_all    = torch.stack(val_list,  dim=1)
+        entropy_all   = torch.stack(ent_list, dim=1)
+
+        return log_probs_all, values_all, entropy_all
+
     def _get_comm_s(self, i, n_n, x, h, p):
         h = h.cuda()
         x = x.cuda()

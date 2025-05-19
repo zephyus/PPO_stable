@@ -451,18 +451,86 @@ class MA2PPO_NC(MA2C_NC):
         logging.info(f"[{self.name}] buffer re-init with GAE λ={self.gae_lambda}")
 
     def update(self, R_bootstrap_agents, dt, summary_writer=None, global_step=None):
-        """
-        PPO update: sample rollout, then run multi-epoch minibatch clipped objective.
-        """
-        # sample_transition returns:
-        # obs, actions, old_logps, dones, returns (V_target), advs, old_values
-        obs, actions, old_logps, dones, returns, advs, old_values = \
+        # sample rollout from buffer (now returns fps)
+        obs, actions, old_logps, dones, returns, advs, old_values, fps = \
             self.trans_buffer.sample_transition(R_bootstrap_agents, dt)
 
-        # convert to torch tensors and dispatch to device
-        # ... prepare data, normalize advs if required, generate minibatches ...
+        device = self.policy.device
+        n_agents, T, obs_dim = obs.shape
 
-        # multi-epoch PPO loop (stub)
-        logging.info(f"[{self.name}] update called at step {global_step}, buffer size {self.trans_buffer.size}")
-        # TODO: implement full PPO loss, minibatch loop, optimizer steps
-        return None  # placeholder
+        # transpose fps to time-major: (T, n_agents, fp_dim)
+        fps_tm = torch.from_numpy(fps.transpose(1,0,2)).to(device).float()
+
+        # ...transpose obs/actions/etc as before...
+        obs_tm   = torch.from_numpy(obs.transpose(1,0,2)).to(device).float()
+        act_tm   = torch.from_numpy(actions.transpose(1,0)).to(device).long()
+        oldlp_tm = torch.from_numpy(old_logps.transpose(1,0)).to(device).float()
+        ret_tm   = torch.from_numpy(returns.transpose(1,0)).to(device).float()
+        adv_tm   = torch.from_numpy(advs.transpose(1,0)).to(device).float()
+        val_tm   = torch.from_numpy(old_values.transpose(1,0)).to(device).float()
+
+        if self.normalize_advantage:
+            adv_tm = (adv_tm - adv_tm.mean()) / (adv_tm.std() + 1e-8)
+
+        total_steps = T
+        mb_size = total_steps // self.num_minibatches
+        sum_pl = sum_vl = sum_el = updates = 0
+
+        for _ in range(self.ppo_epochs):
+            idx_perm = torch.randperm(total_steps, device=device)
+            for start in range(0, total_steps, mb_size):
+                mb_idx = idx_perm[start:start+mb_size]
+                mb_obs    = obs_tm[mb_idx]    # (mb, n_agents, obs_dim)
+                mb_fps    = fps_tm[mb_idx]    # (mb, n_agents, fp_dim)
+                mb_act    = act_tm[mb_idx]
+                mb_oldlp  = oldlp_tm[mb_idx]
+                mb_ret    = ret_tm[mb_idx]
+                mb_adv    = adv_tm[mb_idx]
+                mb_val    = val_tm[mb_idx]
+
+                newlp, newv, ent = self.policy.evaluate_actions_values_and_entropy(
+                    mb_obs, mb_fps, mb_act
+                )
+                ratio = torch.exp(newlp - mb_oldlp.detach())
+                surr1 = ratio * mb_adv.detach()
+                surr2 = torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon) * mb_adv.detach()
+                ploss = -torch.min(surr1, surr2).mean()
+
+                if self.value_clip_param>0:
+                    v_clipped = mb_val.detach() + torch.clamp(newv - mb_val.detach(),
+                                                             -self.value_clip_param,
+                                                             self.value_clip_param)
+                    vf1 = (newv - mb_ret.detach()).pow(2)
+                    vf2 = (v_clipped - mb_ret.detach()).pow(2)
+                    vloss = 0.5 * torch.max(vf1, vf2).mean()
+                else:
+                    vloss = 0.5 * (newv - mb_ret.detach()).pow(2).mean()
+
+                eloss = -ent.mean()
+                loss = ploss + self.v_coef*vloss + self.e_coef*eloss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                if self.max_grad_norm>0:
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
+                sum_pl += ploss.item()
+                sum_vl += vloss.item()
+                sum_el += eloss.item()
+                updates += 1
+
+        if self.lr_decay!='constant' and global_step is not None:
+            self._update_lr(global_step)
+
+        if updates>0 and summary_writer and global_step is not None:
+            avg_pl = sum_pl/updates
+            avg_vl = sum_vl/updates
+            avg_el = sum_el/updates
+            avg_total = avg_pl + self.v_coef*avg_vl + self.e_coef*avg_el
+            summary_writer.add_scalar(f'{self.name}/ppo_actor_loss', avg_pl, global_step)
+            summary_writer.add_scalar(f'{self.name}/ppo_critic_loss', avg_vl, global_step)
+            summary_writer.add_scalar(f'{self.name}/ppo_entropy_loss', avg_el, global_step)
+            summary_writer.add_scalar(f'{self.name}/ppo_total_loss', avg_total, global_step)
+            return avg_pl, avg_vl, avg_el, avg_total
+        return 0.0,0.0,0.0,0.0
