@@ -55,13 +55,13 @@ class Policy(nn.Module):
                 for na_val, na_dim in zip(na_ls, self.na_dim_ls):
                     na_sparse.append(torch.squeeze(one_hot(na_val, na_dim), dim=1))
                 na_sparse = torch.cat(na_sparse, dim=1)
-            h = torch.cat([h, na_sparse.cuda()], dim=1)
+            h = torch.cat([h, na_sparse.to(h.device)], dim=1)
         return self.critic_head(h).squeeze()
 
     def _run_loss(self, actor_dist, e_coef, v_coef, vs, As, Rs, Advs):
-        As = As.cuda()
-        Advs = Advs.cuda()
-        Rs = Rs.cuda()
+        As = As.to(vs.device)
+        Advs = Advs.to(vs.device)
+        Rs = Rs.to(vs.device)
         log_probs = actor_dist.log_prob(As)
         policy_loss = -(log_probs * Advs).mean()
         entropy_loss = -(actor_dist.entropy()).mean() * e_coef
@@ -95,8 +95,8 @@ class LstmPolicy(Policy):
                  e_coef, v_coef, summary_writer=None, global_step=None):
         obs = torch.from_numpy(obs).float()
         dones = torch.from_numpy(dones).float()
-        obs = obs.cuda()
-        dones = dones.cuda()
+        obs = obs.to(self.fc_layer.weight.device)
+        dones = dones.to(self.fc_layer.weight.device)
         xs = self._encode_ob(obs)
         hs, new_states = run_rnn(self.lstm_layer, xs, dones, self.states_bw)
         self.states_bw = new_states.detach()
@@ -118,8 +118,8 @@ class LstmPolicy(Policy):
                 self.loss)
 
     def forward(self, ob, done, naction=None, out_type='p'):
-        ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float().cuda()
-        done = torch.from_numpy(np.expand_dims(done, axis=0)).float().cuda()
+        ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float().to(self.fc_layer.weight.device)
+        done = torch.from_numpy(np.expand_dims(done, axis=0)).float().to(self.fc_layer.weight.device)
         x = self._encode_ob(ob)
         h, new_states = run_rnn(self.lstm_layer, x, done, self.states_fw)
         if out_type.startswith('p'):
@@ -140,8 +140,15 @@ class LstmPolicy(Policy):
         self._init_critic_head(self.n_lstm)
 
     def _reset(self):
-        self.states_fw = torch.zeros(self.n_lstm * 2)
-        self.states_bw = torch.zeros(self.n_lstm * 2)
+        if hasattr(self, 'fc_layer') and hasattr(self.fc_layer, 'weight'): # Check if fc_layer and its weight exist
+            current_device = self.fc_layer.weight.device
+        else:
+            # Fallback, should be avoided if __init__ is correct
+            logging.warning(f"Could not infer device for LstmPolicy {self.name} during _reset. Defaulting to CPU.")
+            current_device = torch.device("cpu")
+
+        self.states_fw = torch.zeros(self.n_lstm * 2, device=current_device)
+        self.states_bw = torch.zeros(self.n_lstm * 2, device=current_device)
 
 
 class FPPolicy(LstmPolicy):
@@ -191,12 +198,15 @@ class NCMultiAgentPolicy(Policy):
         self._reset()
         self.zero_pad = nn.Parameter(torch.zeros(1, 2*self.n_fc), requires_grad=False)
         self.latest_attention_scores = None
-        
+
         use_gat_env_value = os.getenv('USE_GAT', '1')
         logging.info(f"DEBUG: os.getenv('USE_GAT', '1') returned: '{use_gat_env_value}' (type: {type(use_gat_env_value)}")
-                
+
         self.use_gat = use_gat_env_value == '1'
         logging.info(f"DEBUG: self.use_gat evaluated to: {self.use_gat}")
+
+        # capture device placeholder; real device set when model.to(device) is called
+        self.device = next(self.parameters()).device
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
@@ -248,7 +258,8 @@ class NCMultiAgentPolicy(Policy):
         self.states_fw = new_states.detach()
         return actor_logits, value_list, softmax_probs
 
-    def evaluate_actions_values_and_entropy(self, obs_batch, fps_batch, actions_batch, initial_lstm_states=None):
+    def evaluate_actions_values_and_entropy(self, obs_batch, fps_batch,
+                                            actions_batch, initial_lstm_states_batch=None):
         """
         Phase 0 PPO minibatch evaluation via per-sample _run_comm_layers calls.
         Returns log_probs_all, values_all, entropy_all of shape (B, n_agents).
@@ -259,36 +270,36 @@ class NCMultiAgentPolicy(Policy):
         H = self.n_h
 
         # initial LSTM states
-        if initial_lstm_states is None:
-            init_states = torch.zeros(n_agent, H*2, device=device)
-        else:
-            init_states = initial_lstm_states
+        if initial_lstm_states_batch is None:
+            default_state = torch.zeros(n_agent, H*2, device=device)
 
         # collect hidden states per agent
         h_batches = [[] for _ in range(n_agent)]
         for b in range(B):
-            ob_b   = obs_batch[b:b+1]        # (1, n_agents, obs_dim)
-            fp_b   = fps_batch[b:b+1]        # (1, n_agents, fp_dim)
-            done_b = torch.zeros(1, device=device)  # assume no reset inside PPO minibatch
-
-            # single-sample forward: returns (n_agents, 1, H)
-            h_b, _ = self._run_comm_layers(ob_b, done_b, fp_b, init_states)
+            ob_b = obs_batch[b:b+1].to(device)
+            fp_b = fps_batch[b:b+1].to(device)
+            done_b = torch.zeros(1, device=device)
+            init_s = (initial_lstm_states_batch[b].to(device)
+                      if initial_lstm_states_batch is not None
+                      else default_state)
+            h_b, _ = self._run_comm_layers(ob_b, done_b, fp_b, init_s)
             for i in range(n_agent):
-                h_batches[i].append(h_b[i])   # append (1, H)
+                h_batches[i].append(h_b[i])
 
         # stack into (n_agents, B, H)
-        h_states = torch.stack([torch.cat(h_batches[i], dim=0) for i in range(n_agent)], dim=0)
+        h_states = torch.stack([torch.cat(h_batches[i], dim=0)
+                                 for i in range(n_agent)], dim=0)
 
         # compute log_probs, values, entropy in batch
         logp_list, val_list, ent_list = [], [], []
         for i in range(n_agent):
-            h_i      = h_states[i]                   # (B, H)
-            logits_i = self.actor_heads[i](h_i)      # (B, n_actions)
+            h_i      = h_states[i]                     # (B, H)
+            logits_i = self.actor_heads[i](h_i)        # (B, n_actions)
             val_i    = self.ppo_value_heads[i](h_i).squeeze(-1)  # (B,)
             dist_i   = torch.distributions.Categorical(logits=logits_i)
 
-            logp_i = dist_i.log_prob(actions_batch[:, i])       # (B,)
-            ent_i  = dist_i.entropy()                            # (B,)
+            logp_i = dist_i.log_prob(actions_batch[:, i].to(device))
+            ent_i  = dist_i.entropy()
 
             logp_list.append(logp_i)
             val_list.append(val_i)
@@ -296,16 +307,14 @@ class NCMultiAgentPolicy(Policy):
 
         # shape to (B, n_agents)
         log_probs_all = torch.stack(logp_list, dim=1)
-        values_all    = torch.stack(val_list,  dim=1)
+        values_all    = torch.stack(val_list, dim=1)
         entropy_all   = torch.stack(ent_list, dim=1)
 
         return log_probs_all, values_all, entropy_all
 
     def _get_comm_s(self, i, n_n, x, h, p):
-        h = h.cuda()
-        x = x.cuda()
-        p = p.cuda()
-        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().cuda()
+        device = x.device
+        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().to(device)
         m_i = torch.index_select(h, 0, js).view(1, self.n_h * n_n)
         p_i = torch.index_select(p, 0, js)
         nx_i = torch.index_select(x, 0, js)
@@ -328,7 +337,9 @@ class NCMultiAgentPolicy(Policy):
         current_n_ns = fc_x_input.size(1)
         fc_x = self._get_fc_x(i, n_n, current_n_ns)
         s_x = F.relu(fc_x(fc_x_input))
-        return torch.cat([s_x, F.relu(self.fc_p_layers[i](p_i)), F.relu(self.fc_m_layers[i](m_i))], dim=1)
+        return torch.cat([s_x.to(device),
+                          F.relu(self.fc_p_layers[i](p_i.to(device))),
+                          F.relu(self.fc_m_layers[i](m_i.to(device)))] , dim=1)
 
     def _get_neighbor_dim(self, i_agent):
         n_n = int(np.sum(self.neighbor_mask[i_agent]))
@@ -358,7 +369,7 @@ class NCMultiAgentPolicy(Policy):
         else:
             self.fc_m_layers.append(None)
             self.fc_p_layers.append(None)
-        
+
         lstm_layer = nn.LSTMCell(3 * self.n_fc, self.n_h)
         init_layer(lstm_layer, 'lstm')
         self.lstm_layers.append(lstm_layer)
@@ -379,7 +390,7 @@ class NCMultiAgentPolicy(Policy):
         self.ns_ls_ls = []
         self.na_ls_ls = []
         self.n_n_ls = []
-        
+
         # replace multi‐head GraphAttention with PyG GATConv
         self.gat_num_heads = self.model_config.getint('gat_num_heads', 8) if self.model_config else 8
         gat_input_dim = 3 * self.n_fc
@@ -412,7 +423,7 @@ class NCMultiAgentPolicy(Policy):
         # add GAT multi‐head output projection
         self.gat_output_projection = nn.Linear(3 * self.n_fc, 3 * self.n_fc, bias=False)
         nn.init.xavier_uniform_(self.gat_output_projection.weight.data, gain=1.414)
-        
+
         for i in range(self.n_agent):
             n_n, n_ns, n_na, ns_ls, na_ls = self._get_neighbor_dim(i)
             self.ns_ls_ls.append(ns_ls)
@@ -428,9 +439,32 @@ class NCMultiAgentPolicy(Policy):
             init_layer(ppo_v, 'fc')
             self.ppo_value_heads.append(ppo_v)
 
+        if list(self.parameters()):
+            self.device = next(self.parameters()).device
+        else:
+            logging.warning(f"[{self.name}] cannot infer device in _init_net.")
+
     def _reset(self):
-        self.states_fw = torch.zeros(self.n_agent, self.n_h * 2)
-        self.states_bw = torch.zeros(self.n_agent, self.n_h * 2)
+        # self.device should have been set in __init__
+        if not hasattr(self, 'device') or self.device is None: # Defensive check
+            # This case should ideally not happen if __init__ is correctly executed
+            # and the model has parameters.
+            logging.error(f"Device not properly set for NCMultiAgentPolicy instance {self.name} during _reset. Attempting to infer or defaulting to CPU.")
+            try:
+                # Attempt to infer device from a parameter if available
+                current_device = next(self.parameters()).device
+                logging.info(f"Inferred device {current_device} for {self.name} in _reset.")
+                self.device = current_device # Cache it for future use if it was missing
+            except StopIteration:
+                # No parameters, or some other issue
+                logging.error(f"Could not infer device for {self.name} from parameters in _reset. Defaulting to CPU.")
+                current_device = torch.device("cpu")
+                self.device = current_device # Cache it
+        else:
+            current_device = self.device
+
+        self.states_fw = torch.zeros(self.n_agent, self.n_h * 2, device=current_device)
+        self.states_bw = torch.zeros(self.n_agent, self.n_h * 2, device=current_device)
 
     def _run_actor_heads(self, hs, detach=False):
         logits_list = []
@@ -443,73 +477,45 @@ class NCMultiAgentPolicy(Policy):
         return logits_list
 
     def _run_comm_layers(self, obs, dones, fps, states):
-        obs = batch_to_seq(obs)
-        dones = batch_to_seq(dones)
-        fps = batch_to_seq(fps)
-        h, c = torch.chunk(states, 2, dim=1)
-        h = h.cuda()
-        c = c.cuda()
+        device = states.device
+        obs_seq   = batch_to_seq(obs)    # chunks preserve device if obs is tensor
+        dones_seq = batch_to_seq(dones)
+        fps_seq   = batch_to_seq(fps)
+        h, c = torch.chunk(states.to(device), 2, dim=1)
         outputs = []
-        for t, (x, p, done) in enumerate(zip(obs, fps, dones)):
-            done = done.cuda()
-            x = x.cuda()
-            p = p.cuda()
-            next_h = []
-            next_c = []
-            x = x.squeeze(0)
-            p = p.squeeze(0)
-            s_list = []
+        for x_t, p_t, done_t in zip(obs_seq, fps_seq, dones_seq):
+            x_t    = x_t.to(device)
+            p_t    = p_t.to(device)
+            done_t = done_t.to(device)
+            curr_h = h * (1 - done_t)
+            curr_c = c * (1 - done_t)
+            x_s = x_t.squeeze(0)
+            p_s = p_t.squeeze(0)
+            next_h, next_c = [], []
             for i in range(self.n_agent):
                 n_n = int(self.neighbor_mask[i].sum().item())
                 if n_n:
-                    s = self._get_comm_s(i, n_n, x, h, p)
+                    s = self._get_comm_s(i, n_n, x_s, curr_h, p_s)
                 else:
                     if self.identical:
-                        x_i = x[i].unsqueeze(0)
+                        x_i = x_s[i].unsqueeze(0)
                         current_n_ns = x_i.size(1)
                     else:
-                        x_i = x[i].narrow(0, 0, self.n_s_ls[i]).unsqueeze(0)
+                        x_i = x_s[i].narrow(0, 0, self.n_s_ls[i]).unsqueeze(0)
                         current_n_ns = self.n_s_ls[i]
                     fc_x = self._get_fc_x(i, 0, current_n_ns)
                     s_x = F.relu(fc_x(x_i))
-                    s = torch.cat([s_x, self.zero_pad], dim=1)
-                s_list.append(s.squeeze(0))
-            
-            s_all = torch.stack(s_list, dim=0)
-
-            # preserve original features for residual
-            s_all_input = s_all
-
-            if self.use_gat and hasattr(self, 'gat_layer'):
-                # Pre‐Norm
-                s_block_input = s_all_input
-                s_input_for_gat = self.pre_gat_ln(s_block_input) if (self.use_layer_norm and hasattr(self, 'pre_gat_ln')) else s_block_input
-                # single PyG GATConv
-                s_after = self.gat_layer(s_input_for_gat, self.edge_index)
-                s_proj = self.gat_output_projection(s_after) if hasattr(self, 'gat_output_projection') else s_after
-                self.latest_attention_scores = None  # attention extraction not yet handled
-                # Residual
-                s_all = (s_block_input + s_proj) if self.use_residual else s_proj
-            elif not self.use_gat:
-                self.latest_attention_scores = None
-                s_all = s_all_input
-            else:
-                logging.error("GAT intended but gat_layer not properly initialized.")
-                self.latest_attention_scores = None
-                s_all = s_all_input
-            
-            for i in range(self.n_agent):
-                s_i = s_all[i].unsqueeze(0)
-                h_i, c_i = h[i].unsqueeze(0) * (1-done), c[i].unsqueeze(0) * (1-done)
-                next_h_i, next_c_i = self.lstm_layers[i](s_i, (h_i, c_i))
-                next_h.append(next_h_i)
-                next_c.append(next_c_i)
-            
-            h, c = torch.cat(next_h), torch.cat(next_c)
+                    s = torch.cat([s_x.to(device), self.zero_pad.to(device)], dim=1)
+                h_i = curr_h[i].unsqueeze(0)
+                c_i = curr_c[i].unsqueeze(0)
+                nh, nc = self.lstm_layers[i](s.unsqueeze(0).to(device), (h_i, c_i))
+                next_h.append(nh)
+                next_c.append(nc)
+            h = torch.cat(next_h, dim=0)
+            c = torch.cat(next_c, dim=0)
             outputs.append(h.unsqueeze(0))
-        
-        outputs = torch.cat(outputs)
-        return outputs.transpose(0, 1), torch.cat([h, c], dim=1)
+        outputs = torch.cat(outputs, dim=0)          # (seq_len, n_agents, H)
+        return outputs.transpose(0,1), torch.cat([h, c], dim=1)
 
     def _run_critic_heads(self, hs, actions, detach=False):
         vs = []
@@ -520,7 +526,7 @@ class NCMultiAgentPolicy(Policy):
                 na_i = torch.index_select(actions, 0, js)
                 na_i_ls = []
                 for j in range(n_n):
-                    na_i_ls.append(one_hot(na_i[j], self.na_ls_ls[i][j]).cuda())
+                    na_i_ls.append(one_hot(na_i[j], self.na_ls_ls[i][j]).to(self.device))
                 h_i = torch.cat([hs[i]] + na_i_ls, dim=1)
             else:
                 h_i = hs[i]
@@ -671,7 +677,7 @@ class NCLMMultiAgentPolicy(NCMultiAgentPolicy):
                         na_i = torch.index_select(preactions, 0, js)
                         na_i_ls = []
                         for j in range(n_n):
-                            na_i_ls.append(one_hot(na_i[j], self.na_ls_ls[i][j]).cuda())
+                            na_i_ls.append(one_hot(na_i[j], self.na_ls_ls[i][j]).to(self.device))
                         h_i = torch.cat([hs[i]] + na_i_ls, dim=1)
                     else:
                         h_i = hs[i]
@@ -774,10 +780,8 @@ class CommNetMultiAgentPolicy(NCMultiAgentPolicy):
         self.lstm_layers.append(lstm_layer)
 
     def _get_comm_s(self, i, n_n, x, h, p):
-        h = h.cuda()
-        x = x.cuda()
-        p = p.cuda()
-        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().cuda()
+        device = h.device
+        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().to(device)
         m_i = torch.index_select(h, 0, js).mean(dim=0, keepdim=True)
         nx_i = torch.index_select(x, 0, js)
         if self.identical:
@@ -821,9 +825,10 @@ class DIALMultiAgentPolicy(NCMultiAgentPolicy):
         self.lstm_layers.append(lstm_layer)
 
     def _get_comm_s(self, i, n_n, x, h, p):
-        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().cuda()
-        m_i = torch.index_select(h, 0, js).view(1, self.n_h * n_n).cuda()
-        nx_i = torch.index_select(x, 0, js).cuda()
+        device = h.device
+        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().to(device)
+        m_i = torch.index_select(h, 0, js).view(1, self.n_h * n_n).to(device)
+        nx_i = torch.index_select(x, 0, js).to(device)
         if self.identical:
             nx_i = nx_i.view(1, self.n_s * n_n)
             x_i = x[i].unsqueeze(0)
@@ -833,7 +838,7 @@ class DIALMultiAgentPolicy(NCMultiAgentPolicy):
                 nx_i_ls.append(nx_i[j].narrow(0, 0, self.ns_ls_ls[i][j]))
             nx_i = torch.cat(nx_i_ls).unsqueeze(0)
             x_i = x[i].narrow(0, 0, self.n_s_ls[i]).unsqueeze(0)
-        a_i = one_hot(p[i].argmax().unsqueeze(0).cpu(), self.n_fc).cuda()
+        a_i = one_hot(p[i].argmax().unsqueeze(0).cpu(), self.n_fc).to(device)
         fc_x_input = torch.cat([x_i, nx_i], dim=1)
         current_n_ns = fc_x_input.size(1)
         fc_x = self._get_fc_x(i, n_n, current_n_ns)

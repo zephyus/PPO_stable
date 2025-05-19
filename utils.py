@@ -224,6 +224,11 @@ class Trainer():
     def explore(self, prev_ob, prev_done):
         ob, done = prev_ob, prev_done
         for _ in range(self.n_step):
+            # get rollout‐start LSTM state before policy.forward updates it
+            if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'states_fw'):
+                lstm_state = self.model.policy.states_fw.cpu().numpy()
+            else:
+                lstm_state = np.zeros((self.env.n_agent, self.model.policy.n_h * 2))
             fps, env_probs, actions_np, logp_np, values_np = self._get_policy(ob, done, mode='train')
             self.env.update_fingerprint(env_probs)
             next_ob, reward, done, global_reward = self.env.step(actions_np)
@@ -231,8 +236,10 @@ class Trainer():
             gs = self.global_counter.next()
             self.cur_step += 1
 
-            # use fps from get_fingerprint, not stale self.ps
-            self.model.add_transition(ob, fps, actions_np, reward, values_np, done, logp_np)
+            # pass lstm_state into add_transition
+            self.model.add_transition(
+                ob, fps, actions_np, reward, values_np, done, logp_np, lstm_state
+            )
 
             # logging
             self.summary_writer.add_scalar('reward/global_reward', global_reward, gs)
@@ -338,34 +345,49 @@ class Trainer():
                     global_step = self.global_counter.cur_step
                     logging.debug(f"step: {global_step}")
 
-                    # --- after explore, compute losses ---
-                    losses_tuple = self.model.backward(R, dt)
-                    if losses_tuple:
-                        if len(losses_tuple) == 4:  # expect basic losses
-                            policy_loss, value_loss, entropy_loss, total_loss = losses_tuple
-                            self.summary_writer.add_scalar('loss/policy', policy_loss.item(), global_step)
-                            self.summary_writer.add_scalar('loss/value', value_loss.item(), global_step)
-                            self.summary_writer.add_scalar('loss/entropy', entropy_loss.item(), global_step)
-                            self.summary_writer.add_scalar('loss/total', total_loss.item(), global_step)
-                            # learning rate
-                            if hasattr(self.model, 'optimizer') and self.model.optimizer:
-                                self.summary_writer.add_scalar(
-                                    'train/learning_rate',
-                                    self.model.optimizer.param_groups[0]['lr'],
-                                    global_step)
-                            # gradient norm
-                            total_norm = 0
-                            for p in self.model.policy.parameters():
-                                if p.grad is not None:
-                                    param_norm = p.grad.data.norm(2)
-                                    total_norm += param_norm.item() ** 2
-                            total_norm = total_norm ** 0.5
-                            self.summary_writer.add_scalar('train/grad_norm', total_norm, global_step)
-                            # flush occasionally
-                            if global_step % 50 == 0:
-                                self.summary_writer.flush()
-                        else:
-                            logging.error(f"Step {global_step}: model.backward() returned {len(losses_tuple)} values, expected 4 for current test.")
+                    # choose update vs backward
+                    if hasattr(self.model, 'update') and callable(self.model.update):
+                        losses_tuple = self.model.update(R, dt,
+                            summary_writer=self.summary_writer,
+                            global_step=global_step)
+                    elif hasattr(self.model, 'backward') and callable(self.model.backward):
+                        losses_tuple = self.model.backward(R, dt,
+                            summary_writer=self.summary_writer,
+                            global_step=global_step)
+                    else:
+                        logging.error(f"Model {type(self.model)} has neither 'update' nor 'backward' method.")
+                        losses_tuple = None
+
+                    if losses_tuple and len(losses_tuple) == 4:
+                        p_loss, v_loss, e_loss, tot_loss = losses_tuple
+                        # handle tensor vs float
+                        pl = p_loss.item() if hasattr(p_loss, 'item') else p_loss
+                        vl = v_loss.item() if hasattr(v_loss, 'item') else v_loss
+                        el = e_loss.item() if hasattr(e_loss, 'item') else e_loss
+                        tl = tot_loss.item() if hasattr(tot_loss, 'item') else tot_loss
+                        self.summary_writer.add_scalar('loss/policy', pl, global_step)
+                        self.summary_writer.add_scalar('loss/value', vl, global_step)
+                        self.summary_writer.add_scalar('loss/entropy', el, global_step)
+                        self.summary_writer.add_scalar('loss/total', tl, global_step)
+                        # learning rate
+                        if hasattr(self.model, 'optimizer') and self.model.optimizer:
+                            self.summary_writer.add_scalar(
+                                'train/learning_rate',
+                                self.model.optimizer.param_groups[0]['lr'],
+                                global_step)
+                        # gradient norm
+                        total_norm = 0
+                        for p in self.model.policy.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** 0.5
+                        self.summary_writer.add_scalar('train/grad_norm', total_norm, global_step)
+                        # flush occasionally
+                        if global_step % 50 == 0:
+                            self.summary_writer.flush()
+                    else:
+                        logging.error(f"Step {global_step}: model.backward() returned {len(losses_tuple)} values, expected 4 for current test.")
 
                     # termination
                     if done:
