@@ -501,25 +501,6 @@ class Trainer():
                 self.global_counter.repair()
                 continue
             
-            # --- 在這裡加入調試打印 ---
-            global_step_at_log = self.global_counter.cur_step # 獲取當前的 global_step
-            logging.debug(f"--- DEBUG PRE-LOG EPISODE (Trainer instance: {id(self)}) ---")
-            logging.debug(f"Attempting to call _log_episode at global_step: {global_step_at_log}")
-            logging.debug(f"Type of self: {type(self)}")
-            logging.debug(f"Class of self: {self.__class__}")
-            logging.debug(f"Is '_log_episode' in dir(self)? {'_log_episode' in dir(self)}")
-            logging.debug(f"Does self instance have '_log_episode'? {hasattr(self, '_log_episode')}")
-            if hasattr(self, '_log_episode'):
-                logging.debug(f"self._log_episode object: {self._log_episode}")
-            else:
-                logging.debug(f"self._log_episode NOT FOUND on instance.")
-            logging.debug(f"Does self's class have '_log_episode'? {hasattr(self.__class__, '_log_episode')}")
-            if hasattr(self.__class__, '_log_episode'):
-                 logging.debug(f"self.__class__._log_episode object: {self.__class__._log_episode}")
-            else:
-                logging.debug(f"self.__class__._log_episode NOT FOUND on class.")
-            logging.debug(f"--- END DEBUG PRE-LOG EPISODE ---")
-            # --- 調試打印結束 ---
 
             rewards = np.array(self.episode_rewards)
             mean_reward = np.mean(rewards)
