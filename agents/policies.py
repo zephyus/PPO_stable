@@ -1,3 +1,5 @@
+#/agents/policies.py
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -303,150 +305,60 @@ class NCMultiAgentPolicy(Policy):
         value_list_squeezed = [val.squeeze(0) if val.numel() == 1 else val for val in value_list_N_of_1]
 
         return actor_logits_squeezed, value_list_squeezed, probs_list_N_of_A
+    
 
     def evaluate_actions_values_and_entropy(
-        self,
-        obs_batch,         # ≈ (B,N,Do) 但實際可能 2~4 維錯位
-        fps_batch,
-        actions_batch,
-        initial_states
-    ):
+            self, obs_batch, fps_batch, actions_batch, initial_states_batch):
         """
-        把所有奇怪 shape 變成 (B, N_agent, Do)
+        Phase-0-plus：  
+        - 仍然外層 loop B，確保每 sample 用自己的 LSTM state  
+        - 把 Actor / Value head 批次化（identical 時一行解決）
+        回傳 (B,N) 的 logp, value, entropy
         """
-        # -------- 先統一變成 ≥3 維 --------
-        if obs_batch.ndim == 2:
-            raise ValueError("obs 只有 2 維？資料管線肯定有誤。")
+        # shape guard ----------------------------------------------------------
+        if obs_batch.shape[0] == self.n_agent and obs_batch.shape[1] != self.n_agent:
+            obs_batch  = obs_batch .permute(1,0,2).contiguous()
+            fps_batch  = fps_batch .permute(1,0,2).contiguous()
+            actions_batch = actions_batch.permute(1,0).contiguous()
 
-        # --- case A: 4-D，且其中一個軸 = N_agent ---
-        if obs_batch.ndim == 4:
-            # 可能是 (B,T,N,Do) 或 (T,N,B,Do)
-            axes = list(obs_batch.shape)
-            try:
-                n_idx = axes.index(self.n_agent)
-            except ValueError:
-                raise ValueError(f"4-D obs 找不到 n_agent={self.n_agent} 這一軸，"
-                                 "請檢查資料產生端。")
+        B, N, _ = obs_batch.shape
+        dev = obs_batch.device
+        if initial_states_batch.dim() == 2:          # (N,2H) → broadcast
+            initial_states_batch = initial_states_batch.unsqueeze(0).expand(B, -1, -1)
 
-            # 重新排列成 (B,T,N,Do)
-            if n_idx == 0:  # (N,B,T,Do) 不太可能，略
-                raise ValueError("Unexpected axis order: (N,B,T,Do)")
-            elif n_idx == 1:  # (T,N,B,Do)
-                obs_batch   = obs_batch.permute(2,0,1,3).contiguous()
-                fps_batch   = fps_batch.permute(2,0,1,3).contiguous()
-                actions_batch = actions_batch.permute(2,0,1).contiguous()
-            elif n_idx == 2:  # (B,T,N,Do) ← 最常見，無需動
-                pass
-            else:
-                # n_idx == 3 → (B,T,Do,N) 也不太合理
-                raise ValueError("Unexpected axis order with n_agent at -1")
+        zeros_done = torch.zeros(1, N, dtype=torch.bool, device=dev)
 
-            # 取最後一個時間步 (T-1)
-            obs_batch      = obs_batch[:, -1]          # (B,N,Do)
-            fps_batch      = fps_batch[:, -1]
-            actions_batch  = actions_batch[:, -1]
+        logp   = torch.zeros(B, N, device=dev)
+        ent    = torch.zeros(B, N, device=dev)
+        values = torch.zeros(B, N, device=dev)
 
-        # --- case B: 3-D，但先檢查是不是 (N,B,Do) / (flat_N,B,Do) ---
-        if obs_batch.ndim == 3:
-            B0, M, D = obs_batch.shape
-            N = self.n_agent
-
-            # (N,B,Do) → (B,N,Do)
-            if B0 == N and M != N:
-                obs_batch   = obs_batch.permute(1,0,2).contiguous()
-                fps_batch   = fps_batch.permute(1,0,2).contiguous()
-                actions_batch = actions_batch.permute(1,0).contiguous()
-
-            # (flat_N,B,Do) → 先換軸
-            elif obs_batch.shape[1] == self.n_agent and obs_batch.shape[0] % N == 0:
-                obs_batch   = obs_batch.permute(1,0,2).contiguous()
-                fps_batch   = fps_batch.permute(1,0,2).contiguous()
-                actions_batch = actions_batch.permute(1,0).contiguous()
-
-            # 此刻仍 3-D：(B, M, Do)
-            B, M, D = obs_batch.shape
-            if M != N:
-                if M % N != 0:
-                    raise ValueError(f"Incoming obs 2-nd dim = {M} 無法整除 n_agent={N}；"
-                                     "資料批次時間步不一致。")
-                T_seq = M // N
-                obs_batch     = obs_batch.view(B, T_seq, N, D)[:, -1]
-                fps_batch     = fps_batch.view(B, T_seq, N, -1)[:, -1]
-                actions_batch = actions_batch.view(B, T_seq, N)[:, -1]
-
-        # --- 最終確認 ---
-        B, N_final, _ = obs_batch.shape
-        assert N_final == self.n_agent, \
-            f"整理完後的 agent 維度 {N_final} ≠ n_agent={self.n_agent}"
-
-        # ==============================
-        # 以下保持不變：device、logp、value 計算…
-        device = obs_batch.device
-        # （原來那段從「If initial_lstm_states_batch.dim() == 2」開始
-        #  直到回傳 logps, values, ents 全部照舊）
-
-
-
-
-        # If initial_states is (N,2H), broadcast to (B,N,2H)
-        if initial_states.dim() == 2:
-            initial_states = (initial_states
-                                         .unsqueeze(0)
-                                         .expand(B, -1, -1)
-                                         .contiguous())
-        
-        # basic sanity checks
-        assert initial_states.dim() == 3, \
-            f"initial_states must be 3D (B,N,2H), got {initial_states.shape}"
-        assert initial_states.shape[0] == B, \
-            f"Batch dim ({initial_states.shape[0]}) ≠ obs batch ({B})"
-        assert initial_states.shape[1] == N, \
-            f"Agent dim ({initial_states.shape[1]}) ≠ obs agents ({N})"
-
-
-        logps  = torch.zeros(B, N, device=device)
-        values = torch.zeros(B, N, device=device)
-        ents   = torch.zeros(B, N, device=device)
-
-        # dones_for_eval is (1,N) as _run_comm_layers expects T=1 for this evaluation path
-        zeros_done_T1_N = torch.zeros(1, N, dtype=torch.bool, device=device)
-
+        # --------  COMM-LSTM 每 sample 跑一次  --------
         for b in range(B):
-            # obs_item is (1,N,Do), fps_item is (1,N,Dfp), initial_states_item is (N,2H)
-            obs_item = obs_batch[b:b+1] 
-            fps_item = fps_batch[b:b+1]
-            initial_states_item_N_2H = initial_states[b]
-
-            # _run_comm_layers expects obs_T_N_Do, dones_T_N, fps_T_N_Dfp, initial_states_N_2H
-            # Here, T (sequence length for LSTM inside _run_comm_layers) is 1.
-            h_sequence_N_T1_H, _ = self._run_comm_layers(
-                obs_item,               # (1,N,Do)
-                zeros_done_T1_N,        # (1,N) - represents dones at the start of this single step
-                fps_item,               # (1,N,Dfp)
-                initial_states_item_N_2H # (N,2H)
+            h_N_T1_H, _ = self._run_comm_layers(
+                obs_batch[b:b+1],          # (1,N,Do)
+                zeros_done,                # (1,N)
+                fps_batch[b:b+1],          # (1,N,Dfp)
+                initial_states_batch[b]    # (N,2H)  ← 關鍵：各用各的
             )
-            # h_sequence_N_T1_H is (N, 1, H)
-            h_N_H = h_sequence_N_T1_H.squeeze(1)    # (N,H)
+            h_N_H = h_N_T1_H.squeeze(1)     # (N,H)
 
-            for i in range(N):
-                # actor_heads and ppo_value_heads expect (batch_size_for_head, H)
-                # Here, batch_size_for_head is 1 as we process one agent's state from one batch item.
-                agent_h_1_H = h_N_H[i].unsqueeze(0) # (1,H)
-                
-                logits_i_1_Ai = self.actor_heads[i](agent_h_1_H)  # (1,A_i)
-                val_i_1       = self.ppo_value_heads[i](agent_h_1_H).squeeze(-1) # (1,)
-                
-                dist_i   = torch.distributions.Categorical(logits=logits_i_1_Ai)
+            if self.identical:
+                logits_N_A = self.actor_heads[0](h_N_H)              # (N,A)
+                dist       = torch.distributions.Categorical(logits=logits_N_A)
+                logp[b]    = dist.log_prob(actions_batch[b])
+                ent [b]    = dist.entropy()
+                values[b]  = self.ppo_value_heads[0](h_N_H).squeeze(-1)
+            else:
+                for i in range(N):                                    # 28 次而已
+                    h_i = h_N_H[i].unsqueeze(0)
+                    dist_i = torch.distributions.Categorical(
+                                logits=self.actor_heads[i](h_i))
+                    logp  [b, i] = dist_i.log_prob(actions_batch[b, i])
+                    ent   [b, i] = dist_i.entropy()
+                    values[b, i] = self.ppo_value_heads[i](h_i).squeeze()
 
-                # actions_batch_B_N is (B,N), so actions_batch_B_N[b,i] is a scalar action
-                action_for_agent_i = actions_batch[b, i].to(device) # scalar
-                
-                logps [b, i] = dist_i.log_prob(action_for_agent_i) # log_prob expects scalar or (1,)
-                ents  [b, i] = dist_i.entropy().squeeze()
-                values[b, i] = val_i_1.squeeze()
+        return logp, values, ent
 
-
-        return logps, values, ents
 
     def _get_comm_s(self, i, n_n, x, h, p):
         device = x.device

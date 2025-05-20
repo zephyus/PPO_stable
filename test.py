@@ -1,3 +1,5 @@
+#test.py
+
 import torch
 print("CUDA Available:", torch.cuda.is_available())
 print("Available Devices:", torch.cuda.device_count())

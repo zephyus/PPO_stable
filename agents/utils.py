@@ -5,7 +5,7 @@ import logging
 import sys  # Import sys for StreamHandler
 
 """
-initializers
+/agents/utils.py
 """
 def init_layer(layer, method='fc'):
     if method == 'fc':

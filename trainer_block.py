@@ -1,149 +1,3 @@
-
-##root(utils.py)
-from functools import total_ordering
-import itertools
-import logging
-import numpy as np
-import time
-import os
-import pandas as pd
-import subprocess
-import copy
-from queue import PriorityQueue
-import sys # Import sys for StreamHandler
-import io   # for UTF-8 wrapper
-import torch
-import torch.nn as nn
-
-
-def check_dir(cur_dir):
-    if not os.path.exists(cur_dir):
-        return False
-    return True
-
-
-def copy_file(src_dir, tar_dir):
-    cmd = f'cp %s %s' % (src_dir, tar_dir)
-    subprocess.check_call(cmd, shell=True)
-
-
-def find_file(cur_dir, suffix='.ini'):
-    for file in os.listdir(cur_dir):
-        if file.endswith(suffix):
-            return cur_dir + '/' + file
-    logging.error('Cannot find %s file' % suffix)
-    return None
-
-
-def init_dir(base_dir, pathes=['log', 'data', 'model']):
-    if not os.path.exists(base_dir):
-        os.mkdir(base_dir)
-    dirs = {}
-    for path in pathes:
-        cur_dir = base_dir + '/%s/' % path
-        if not os.path.exists(cur_dir):
-            os.mkdir(cur_dir)
-        dirs[path] = cur_dir
-    return dirs
-
-
-def init_log(log_file=None):
-    # Configure root logger
-    log_format = '%(asctime)s [%(levelname)s] %(message)s'
-    log_level = logging.DEBUG # Set level to DEBUG for detailed output
-
-    # Remove all existing handlers from the root logger
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-
-    # manual handler for UTF-8-safe console output
-    root = logging.getLogger()
-    root.setLevel(log_level)
-    utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", write_through=True)
-    sh = logging.StreamHandler(stream=utf8_stdout)
-    sh.setFormatter(logging.Formatter(log_format))
-    root.addHandler(sh)
-
-    # Ensure FileHandler remains commented out/inactive
-    # if log_file:
-    #     file_handler = logging.FileHandler(log_file, mode='a')
-    #     file_handler.setFormatter(logging.Formatter(log_format))
-    #     logging.getLogger().addHandler(file_handler) # Add handler to the root logger
-
-    # Log the configuration (optional, kept for consistency)
-    if log_file:
-        logging.info(f"Logging configured. Level: {logging.getLevelName(log_level)}. Outputting to Console and File: {log_file}")
-    else:
-        logging.info(f"Logging configured. Level: {logging.getLevelName(log_level)}. Outputting to Console (stdout).")
-
-
-def init_test_flag(test_mode):
-    if test_mode == 'no_test':
-        return False, False
-    if test_mode == 'in_train_test':
-        return True, False
-    if test_mode == 'after_train_test':
-        return False, True
-    if test_mode == 'all_test':
-        return True, True
-    return False, False
-
-# for save top-5 best model
-class MyQueue:
-    def __init__(self, model_dir, maxsize=0) -> None:
-        self.priorityq = PriorityQueue(maxsize=maxsize)
-        self.model_dir = model_dir
-        
-    def peek(self):
-        return self.priorityq.queue[0]
-    
-    def empty(self):
-        return self.priorityq.empty()
-    
-    def add(self, value, model_name, model) -> None:
-        if(self.priorityq.full()):
-            min_v = self.priorityq.get()
-            if os.path.isfile(self.model_dir + 'checkpoint-{:d}.pt'.format(min_v[1])):
-                os.remove(self.model_dir + 'checkpoint-{:d}.pt'.format(min_v[1]))
-        self.priorityq.put((value, model_name))
-        model.save(self.model_dir, model_name)
-        
-
-class Counter:
-    def __init__(self, total_step, test_step, log_step):
-        self.counter = itertools.count(1)
-        self.cur_step = 0
-        self.cur_test_step = 0
-        self.total_step = total_step
-        self.test_step = test_step
-        self.log_step = log_step
-        self.stop = False
-
-    def next(self):
-        self.cur_step = next(self.counter)
-        return self.cur_step
-
-    def should_test(self):
-        test = False
-        if (self.cur_step - self.cur_test_step) >= self.test_step:
-            test = True
-            self.cur_test_step = self.cur_step
-        return test
-
-    def should_log(self):
-        return (self.cur_step % self.log_step == 0)
-
-    def should_stop(self):
-        if self.cur_step >= self.total_step:
-            return True
-        return self.stop
-    
-    def repair(self):
-        self.counter = itertools.count(int(self.cur_step/720)* 720 + 1, 1)
-        
-    def force_stop(self):
-        self.cur_step = 1000080
-
 class Trainer():
     #env可以去看.ini檔，裡面就有一整個叫做ENV_CONFIG的地方
     def __init__(self, env, model, global_counter, summary_writer, output_path=None):
@@ -215,8 +69,6 @@ class Trainer():
             return max(r) + min(r)
         except ValueError:
             return 0
-# 在 /workspace/my_deeprl_network/utils.py 的 Trainer 類別中
-# 請用以下完整的方法替換您現有的 _get_policy 方法
 
     def _get_policy(self, ob, done, mode='train'):
         # prepare outputs
@@ -225,81 +77,41 @@ class Trainer():
         actions_np  = np.zeros(n, dtype=np.int32)
         logp_np     = np.zeros(n, dtype=np.float32)
         values_np   = np.zeros(n, dtype=np.float32)
-        env_probs   = [None]*n # Initialize with Nones for all N agents
+        env_probs   = [None]*n
 
-        # --- START OF CRITICAL MODIFICATION for 'done' type ---
-        # 這段邏輯確保 done_for_policy 是一個 (N,) 的 NumPy boolean 陣列
-        done_for_policy = None 
-        if isinstance(done, bool): 
-            done_for_policy = np.array([done] * n, dtype=bool)
-        elif isinstance(done, (list, np.ndarray)) and hasattr(done, '__len__') and len(done) == n:
-            done_for_policy = np.asarray(done, dtype=bool)
-        elif isinstance(done, np.ndarray) and done.ndim == 0: 
-            done_for_policy = np.array([done.item()] * n, dtype=bool)
-        else:
-            logging.warning(
-                f"Trainer._get_policy: Unexpected 'done' type ({type(done)}) or "
-                f"shape ({str(getattr(done, 'shape', 'N/A'))}). "
-                f"Value: {str(done)[:50]}. Defaulting to all False for policy input."
-            )
-            done_for_policy = np.array([False] * n, dtype=bool)
-        # --- END OF CRITICAL MODIFICATION ---
-
-
-
-        # 確保 self.agent 存在且是字串
-        if not hasattr(self, 'agent') or not isinstance(self.agent, str):
-            raise AttributeError("Trainer instance 'self.agent' is not set or not a string.")
-
-        # 使用修正後的 done_for_policy 調用模型
-        if self.agent.startswith('ma2c') or self.agent.startswith('mappo'):
-            # 確認 self.model.forward 接收的是 done_for_policy
-            logits_list, value_list, probs_list = self.model.forward(ob, done_for_policy, fps)
-            
-            # 安全地處理 probs_list 和 value_list 可能不是預期長度的情況 (儘管理想中它們應該是長度為 n 的列表)
-            if not (isinstance(logits_list, list) and len(logits_list) == n and
-                    isinstance(value_list, list) and len(value_list) == n and
-                    isinstance(probs_list, list) and len(probs_list) == n):
-                logging.error(f"Mismatched return lengths from model.forward for agent type {self.agent}. "
-                              f"Expected {n} elements for logits, values, probs. "
-                              f"Got: logits({len(logits_list) if isinstance(logits_list, list) else type(logits_list)}), "
-                              f"values({len(value_list) if isinstance(value_list, list) else type(value_list)}), "
-                              f"probs({len(probs_list) if isinstance(probs_list, list) else type(probs_list)})")
-                # 可以在這裡拋出異常或返回預設值，取決於您希望如何處理這種錯誤情況
-                # 為避免進一步錯誤，這裡我們可能需要返回，或者確保後續的循環不會出錯
-                # return fps, env_probs, actions_np, logp_np, values_np # 返回初始化的值
-
+        if self.agent.startswith('ma2c'):
+            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
             for i in range(n):
-                # 添加檢查確保 list 中的元素是 Tensor
-                if not (isinstance(logits_list[i], torch.Tensor) and 
-                        isinstance(value_list[i], torch.Tensor) and
-                        isinstance(probs_list[i], torch.Tensor)):
-                    logging.error(f"Agent {i}: Expected Tensors from model.forward outputs. "
-                                  f"Got: logit({type(logits_list[i])}), value({type(value_list[i])}), prob({type(probs_list[i])})")
-                    # 根據情況處理，例如跳過這個 agent 或使用預設值
-                    continue # 跳過這個 agent 的處理
-
+                dist = torch.distributions.Categorical(logits=logits_list[i])
+                if mode=='train':
+                    a_i = dist.sample()
+                else:
+                    a_i = torch.argmax(logits_list[i], dim=-1)
+                actions_np[i]   = a_i.item()
+                logp_np[i]      = dist.log_prob(a_i).item()
+                values_np[i]    = value_list[i].item()
+                env_probs[i]    = probs_list[i].squeeze().cpu().detach().numpy()
+        elif self.agent.startswith('mappo'):
+            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
+            for i in range(n):
                 dist = torch.distributions.Categorical(logits=logits_list[i])
                 if mode == 'train':
                     a_i = dist.sample()
                 else:
                     a_i = torch.argmax(logits_list[i], dim=-1)
-                
-                actions_np[i]  = a_i.item()
-                logp_np[i]     = dist.log_prob(a_i).item()
-                values_np[i]   = value_list[i].item() # 假設 value_list[i] 是純量 Tensor
-                env_probs[i]   = probs_list[i].squeeze().cpu().detach().numpy()
-
-        elif self.agent == 'greedy':
-            # 假設 greedy model 的 forward 只需要 ob
-            # 如果它也需要 done 或 fps，您需要相應地傳遞 done_for_policy 和 fps
-            a = self.model.forward(ob) 
+                actions_np[i] = a_i.item()
+                logp_np[i]   = dist.log_prob(a_i).item()
+                values_np[i] = value_list[i].item()
+                env_probs[i] = probs_list[i].squeeze().cpu().detach().numpy()
+        elif self.agent=='greedy':
+            a = self.model.forward(ob)
             actions_np[:] = np.array(a)
-            # logp_np 和 values_np 對於 greedy 保持為零
         else:
-            raise NotImplementedError(f"Agent type {self.agent} not implemented in _get_policy.")
+            raise NotImplementedError(self.agent)
 
         return fps, env_probs, actions_np, logp_np, values_np
+
+
     def explore(self, prev_ob, prev_done):
         ob, done = prev_ob, prev_done
         for _ in range(self.n_step):
@@ -500,27 +312,6 @@ class Trainer():
                 logging.exception("An error occurred during run()")
                 self.global_counter.repair()
                 continue
-            
-            # --- 在這裡加入調試打印 ---
-            global_step_at_log = self.global_counter.cur_step # 獲取當前的 global_step
-            logging.debug(f"--- DEBUG PRE-LOG EPISODE (Trainer instance: {id(self)}) ---")
-            logging.debug(f"Attempting to call _log_episode at global_step: {global_step_at_log}")
-            logging.debug(f"Type of self: {type(self)}")
-            logging.debug(f"Class of self: {self.__class__}")
-            logging.debug(f"Is '_log_episode' in dir(self)? {'_log_episode' in dir(self)}")
-            logging.debug(f"Does self instance have '_log_episode'? {hasattr(self, '_log_episode')}")
-            if hasattr(self, '_log_episode'):
-                logging.debug(f"self._log_episode object: {self._log_episode}")
-            else:
-                logging.debug(f"self._log_episode NOT FOUND on instance.")
-            logging.debug(f"Does self's class have '_log_episode'? {hasattr(self.__class__, '_log_episode')}")
-            if hasattr(self.__class__, '_log_episode'):
-                 logging.debug(f"self.__class__._log_episode object: {self.__class__._log_episode}")
-            else:
-                logging.debug(f"self.__class__._log_episode NOT FOUND on class.")
-            logging.debug(f"--- END DEBUG PRE-LOG EPISODE ---")
-            # --- 調試打印結束 ---
-
             rewards = np.array(self.episode_rewards)
             mean_reward = np.mean(rewards)
             std_reward = np.std(rewards)
@@ -535,84 +326,3 @@ class Trainer():
         df = pd.DataFrame(self.data)
         df.to_csv(self.output_path + 'train_reward.csv')
 
-class Tester(Trainer):
-    def __init__(self, env, model, global_counter, summary_writer, output_path):
-        super().__init__(env, model, global_counter, summary_writer)
-        self.env.train_mode = False
-        self.test_num = self.env.test_num
-        self.output_path = output_path
-        self.data = []
-        logging.info('Testing: total test num: %d' % self.test_num)
-
-    def run_offline(self):
-        # enable traffic measurments for offline test
-        is_record = True
-        record_stats = False
-        self.env.cur_episode = 0
-        self.env.init_data(is_record, record_stats, self.output_path)
-        rewards = []
-        for test_ind in range(self.test_num):
-            rewards.append(self.perform(test_ind))
-            self.env.terminate()
-            time.sleep(2)
-            self.env.collect_tripinfo()
-        avg_reward = np.mean(np.array(rewards))
-        logging.info('Offline testing: avg R: %.2f' % avg_reward)
-        self.env.output_data()
-
-    def run_online(self, coord):
-        self.env.cur_episode = 0
-        while not coord.should_stop():
-            time.sleep(30)
-            if self.global_counter.should_test():
-                rewards = []
-                global_step = self.global_counter.cur_step
-                for test_ind in range(self.test_num):
-                    cur_reward = self.perform(test_ind)
-                    self.env.terminate()
-                    rewards.append(cur_reward)
-                    log = {'agent': self.agent,
-                           'step': global_step,
-                           'test_id': test_ind,
-                           'reward': cur_reward}
-                    self.data.append(log)
-                avg_reward = np.mean(np.array(rewards))
-                self._add_summary(avg_reward, global_step)
-                logging.info('Testing: global step %d, avg R: %.2f' %
-                             (global_step, avg_reward))
-                # self.global_counter.update_test(avg_reward)
-        df = pd.DataFrame(self.data)
-        df.to_csv(self.output_path + 'train_reward.csv')
-
-
-class Evaluator(Tester):
-    def __init__(self, env, model, output_path, gui=False):
-        self.env = env
-        self.model = model
-        self.agent = self.env.agent
-        self.env.train_mode = False
-        self.test_num = self.env.test_num
-        self.output_path = output_path
-        self.gui = gui
-
-    def run(self):
-        if self.gui:
-            is_record = False
-        else:
-            is_record = True
-        record_stats = False
-        self.env.cur_episode = 0
-        self.env.init_data(is_record, record_stats, self.output_path)
-        time.sleep(1)
-        for test_ind in range(self.test_num):
-            reward = None
-            while reward is None:
-                try:
-                    reward, _ = self.perform(test_ind, gui=self.gui)
-                    self.env.terminate()
-                except Exception:
-                    pass
-            logging.info('test %i, avg reward %.2f' % (test_ind, reward))
-            time.sleep(2)
-            self.env.collect_tripinfo()
-        self.env.output_data()

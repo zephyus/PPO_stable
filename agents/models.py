@@ -1,6 +1,5 @@
 """
-IA2C and MA2C algorithms
-@author: Tianshu Chu
+/agents/models.py
 """
 
 import os
@@ -335,11 +334,14 @@ class MA2C_NC(IA2C):
         return policy_loss, value_loss, entropy_loss, total_loss
 
     def forward(self, obs, done, ps, actions=None, out_type='p'):
+
         if self.identical_agent:
+      
             return self.policy.forward(np.array(obs), done, np.array(ps),
                                        actions, out_type)
         else:
             pad_ob, pad_p = self._convert_hetero_states(obs, ps)
+        
             return self.policy.forward(pad_ob, done, pad_p,
                                        actions, out_type)
 
@@ -533,14 +535,7 @@ class MA2PPO_NC(MA2C_NC):
                 mb_adv    = adv_tm[mb_idx]
                 mb_val    = val_tm[mb_idx]
                 mb_lstm_states = lstm_states_tm[mb_idx] # Slice LSTM states for minibatch (mb_size, N, 2H)
-                print("__IN_FILE__", __file__)
-                import inspect
-                print("MODEL file ->", __file__)
-                print("POLICY file ->",
-                    inspect.getfile(self.policy.__class__))
-                print("POLICY eval  sig ->",
-                    inspect.signature(self.policy.evaluate_actions_values_and_entropy))
-
+                
 
                 # Patch M: Vectorized call to policy evaluation
                 newlp, newv, ent = self.policy.evaluate_actions_values_and_entropy(
