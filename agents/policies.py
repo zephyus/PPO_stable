@@ -306,63 +306,74 @@ class NCMultiAgentPolicy(Policy):
 
         return actor_logits_squeezed, value_list_squeezed, probs_list_N_of_A
     
-
     def evaluate_actions_values_and_entropy(
-            self, obs_batch, fps_batch, actions_batch, initial_states_batch):
+        self,
+        obs_B_N_D: torch.Tensor,          # (B, N, obs_dim)
+        fps_B_N_Dfp: torch.Tensor | None, # (B, N, fp_dim)  # Added fps_B_N_Dfp
+        actions_B_N:    torch.Tensor,     # (B, N, act_dim 或離散 index)
+        lstm_states=None                  # 選填: ((1, B*N, H), (1, B*N, H))
+    ):
         """
-        Phase-0-plus：  
-        - 仍然外層 loop B，確保每 sample 用自己的 LSTM state  
-        - 把 Actor / Value head 批次化（identical 時一行解決）
-        回傳 (B,N) 的 logp, value, entropy
+        一次向量化計算整個 minibatch = B × N 個 agent-steps 的
+        - log_prob(action)
+        - state value
+        - entropy
+        以及 LSTM 回傳的新隱狀態。
+
+        傳入/傳出 shape 與舊版保持一致，但不再對 B 做 Python 迴圈。
         """
-        # shape guard ----------------------------------------------------------
-        if obs_batch.shape[0] == self.n_agent and obs_batch.shape[1] != self.n_agent:
-            obs_batch  = obs_batch .permute(1,0,2).contiguous()
-            fps_batch  = fps_batch .permute(1,0,2).contiguous()
-            actions_batch = actions_batch.permute(1,0).contiguous()
+        B, N, _ = obs_B_N_D.shape                       # 取 batch 與 agent 數
 
-        B, N, _ = obs_batch.shape
-        dev = obs_batch.device
-        if initial_states_batch.dim() == 2:          # (N,2H) → broadcast
-            initial_states_batch = initial_states_batch.unsqueeze(0).expand(B, -1, -1)
+        # --- 1) 先拿到 (N,B,H) → 轉 (B,N,H) ---
+        h_N_B_H, lstm_states_new = self._run_comm_layers(
+                obs_B_N_D,
+                dones_T_N=None, # Will be auto-filled by _run_comm_layers
+                fps_T_N_Dfp=fps_B_N_Dfp, # Pass fps_B_N_Dfp here
+                initial_states_N_2H=lstm_states
+        )
+        h_B_N_H = h_N_B_H.transpose(0, 1)  # (B,N,H)
 
-        zeros_done = torch.zeros(1, N, dtype=torch.bool, device=dev)
+        # --- 2) identical==True 的 logits/metrics 批量處理 ---
+        if self.identical:
+            logits_B_N_A = self.actor_heads[0](h_B_N_H)        # (B,N,A)
+            values_B_N   = self.ppo_value_heads[0](h_B_N_H).squeeze(-1) # (B,N)
 
-        logp   = torch.zeros(B, N, device=dev)
-        ent    = torch.zeros(B, N, device=dev)
-        values = torch.zeros(B, N, device=dev)
+            flat_logits  = logits_B_N_A.reshape(-1, logits_B_N_A.size(-1)) # (B*N, A)
+            flat_actions = actions_B_N.reshape(-1) # (B*N)
+            flat_dist    = self._get_dist(flat_logits)
 
-        # --------  COMM-LSTM 每 sample 跑一次  --------
-        for b in range(B):
-            h_N_T1_H, _ = self._run_comm_layers(
-                obs_batch[b:b+1],          # (1,N,Do)
-                zeros_done,                # (1,N)
-                fps_batch[b:b+1],          # (1,N,Dfp)
-                initial_states_batch[b]    # (N,2H)  ← 關鍵：各用各的
-            )
-            h_N_H = h_N_T1_H.squeeze(1)     # (N,H)
+            logp_B_N     = flat_dist.log_prob(flat_actions).view(B, N) # (B,N)
+            entropy_B_N  = flat_dist.entropy().view(B, N) # (B,N)
 
-            if self.identical:
-                logits_N_A = self.actor_heads[0](h_N_H)              # (N,A)
-                dist       = torch.distributions.Categorical(logits=logits_N_A)
-                logp[b]    = dist.log_prob(actions_batch[b])
-                ent [b]    = dist.entropy()
-                values[b]  = self.ppo_value_heads[0](h_N_H).squeeze(-1)
-            else:
-                for i in range(N):                                    # 28 次而已
-                    h_i = h_N_H[i].unsqueeze(0)
-                    dist_i = torch.distributions.Categorical(
-                                logits=self.actor_heads[i](h_i))
-                    logp  [b, i] = dist_i.log_prob(actions_batch[b, i])
-                    ent   [b, i] = dist_i.entropy()
-                    values[b, i] = self.ppo_value_heads[i](h_i).squeeze()
+        # --- 3) heterogeneous 分支保持 list，但按 B 維度批處理 ---
+        else:
+            logits_list, values_list = [], []
+            for i, (actor_h, value_h) in enumerate(zip(self.actor_heads, self.ppo_value_heads)):
+                # h_B_N_H[:, i, :] gives (B, H) for agent i
+                logits_i_B_A = actor_h(h_B_N_H[:, i, :])            # (B,A_i)
+                values_i_B   = value_h(h_B_N_H[:, i, :]).squeeze(-1) # (B)
+                logits_list.append(logits_i_B_A)
+                values_list.append(values_i_B)
 
-        return logp, values, ent
+            logits_B_N_A = logits_list # List of (B,A_i) tensors
+            values_B_N   = torch.stack(values_list, dim=1)          # (B,N)
 
+            logp_cols, ent_cols = [], []
+            for i in range(N): # N is self.n_agent or obs_B_N_D.shape[1]
+                # logits_B_N_A[i] is (B,A_i)
+                dist_i     = self._get_dist(logits_B_N_A[i])
+                # actions_B_N[:, i] is (B)
+                logp_cols.append(dist_i.log_prob(actions_B_N[:, i])) # (B)
+                ent_cols.append(dist_i.entropy()) # (B)
+            logp_B_N    = torch.stack(logp_cols, dim=1) # (B,N)
+            entropy_B_N = torch.stack(ent_cols, dim=1) # (B,N)
+
+        # --- 4) 最終回傳 ---
+        return logp_B_N, values_B_N, entropy_B_N, lstm_states_new
 
     def _get_comm_s(self, i, n_n, x, h, p):
         device = x.device
-        js = torch.from_numpy(np.where(self.neighbor_mask[i])[0]).long().to(device)
+        js = self.neighbor_index_ls[i].to(device)   # <- Use cached neighbor indices
         m_i = torch.index_select(h, 0, js).view(1, self.n_h * n_n)
         p_i_indexed = torch.index_select(p, 0, js)
         # ── ensure at least 1-D when Do==1 ──
@@ -487,7 +498,7 @@ class NCMultiAgentPolicy(Policy):
             self.gat_output_projection = nn.Linear(3 * self.n_fc, 3 * self.n_fc, bias=False)
             nn.init.xavier_uniform_(self.gat_output_projection.weight.data, gain=1.414)
         elif self.use_gat and GATConv is None: # Log if GAT was intended but module missing
-            logging.warning(f"[{self.name}] GAT is configured (use_gat=True) but GATConv module is not available. GAT layers will not be initialized.")
+            logging.warning(f"[{self.name}] GAT is configured (use_gat=True) but GAT layer object is None (likely due to import error or config).")
 
 
         for i in range(self.n_agent):
@@ -519,6 +530,14 @@ class NCMultiAgentPolicy(Policy):
         else:
             logging.warning(f"[{self.name}] cannot infer device in _init_net.")
 
+        # Cache neighbor indices as a list of LongTensors
+        self.neighbor_index_ls = [
+            torch.from_numpy(np.where(mask)[0]).long()
+            for mask in self.neighbor_mask
+        ]
+        # Note: These tensors in neighbor_index_ls are on CPU by default.
+        # They will be moved to the correct device in _get_comm_s using .to(device).
+
     def _reset(self):
         if not hasattr(self, 'device') or self.device is None:
             logging.error(f"Device not properly set for NCMultiAgentPolicy instance {self.name} during _reset. Attempting to infer or defaulting to CPU.")
@@ -547,23 +566,76 @@ class NCMultiAgentPolicy(Policy):
         return logits_list
 
     def _compute_s_features_flat(self, obs_T_N_Do, fps_T_N_Dfp, h_for_comm_N_H):
-        T, N, _ = obs_T_N_Do.shape
-        device = obs_T_N_Do.device
+        """
+        直接一次產生 (T*N, 3*n_fc)；不再對 T 做 for-loop。
+        identical == True 可 100% 去掉時間迴圈；
+        identical == False 先保留 per-agent, 再進階優化。
+        """
+        T, N, Do = obs_T_N_Do.shape
+        device   = obs_T_N_Do.device
+        H        = self.n_h
+        n_fc     = self.n_fc
 
-        s_sequence_pre_gat_list = []
-        for t in range(T):
-            obs_t = obs_T_N_Do[t]
-            fps_t = fps_T_N_Dfp[t]
+        # ---- Step 1. 展平成 (T*N, Do | Dfp | H) ----
+        obs_flat = obs_T_N_Do.reshape(T*N, Do)                 # (TN, Do)
+        fps_dim  = fps_T_N_Dfp.size(-1) if fps_T_N_Dfp is not None else 0
+        if fps_dim:
+            fps_flat = fps_T_N_Dfp.reshape(T*N, fps_dim)       # (TN, Dfp)
+        h_repeat = h_for_comm_N_H.unsqueeze(0).expand(T, N, H).reshape(T*N, H)  # (TN,H)
 
-            s_list_for_gat_t = []
-            for i in range(N):
-                s_agent_i_t = self._get_comm_s(i, self.n_n_ls[i], obs_t, h_for_comm_N_H, fps_t)
-                s_list_for_gat_t.append(s_agent_i_t.squeeze(0))
-            s_all_raw_t = torch.stack(s_list_for_gat_t, dim=0)
-            s_sequence_pre_gat_list.append(s_all_raw_t)
+        # ---- Step 2. 依 Agent 分批組合 s 向量 ----
+        s_cat_list = []
+        for i in range(N):          # 只剩 N 次迴圈
+            n_n = self.n_n_ls[i]
+            idx_nei = self.neighbor_index_ls[i].to(device)     # (n_n,)
 
-        s_sequence_pre_gat = torch.stack(s_sequence_pre_gat_list, dim=0)
-        return s_sequence_pre_gat.reshape(T * N, -1)
+            # gather neighbor h, obs, fp  —— 利用 flatten trick
+            if n_n:
+                # 先算展平 index:  t_idx* N + nei_j
+                base  = torch.arange(T, device=device).unsqueeze(1) * N       # (T,1)
+                idx_flat = (base + idx_nei.unsqueeze(0)).reshape(-1)          # (T*n_n,)
+                # → 取鄰居 hidden / obs / fp
+                m_i_flat  = h_repeat[idx_flat].reshape(T, n_n*H)              # (T, n_n*H)
+                nx_i_flat = obs_flat[idx_flat].reshape(T, n_n*Do)             # (T, n_n*Do)
+                if fps_dim:
+                    p_i_flat  = fps_flat[idx_flat].reshape(T, n_n*fps_dim)    # (T,n_n*Dfp)
+            else:
+                m_i_flat  = torch.zeros(T, 0, device=device)
+                nx_i_flat = torch.zeros(T, 0, device=device)
+                if fps_dim:
+                    p_i_flat = torch.zeros(T, 0, device=device)
+
+            # self.identical 判斷
+            if self.identical:
+                x_i_flat  = obs_T_N_Do[:, i, :].reshape(T, Do)                # (T,Do)
+                fc_x_in   = torch.cat([x_i_flat, nx_i_flat], dim=1)           # (T, Do + n_n*Do)
+            else:
+                # 異質情況，沿用舊 slice 規則
+                x_i_raw = obs_T_N_Do[:, i, :self.n_s_ls[i]].reshape(T, -1)
+                fc_x_in = torch.cat([x_i_raw, nx_i_flat], dim=1)              # (T, n_ns)
+
+            # ---- 線性層運算 (一次性 T) ----
+            fc_x = self._get_fc_x(i, n_n, fc_x_in.size(1))
+            s_x  = F.relu(fc_x(fc_x_in))                                      # (T,n_fc)
+
+            # fingerprint / hidden‐msg 投影
+            if n_n and self.fc_p_layers[i] is not None and fps_dim:
+                p_proj = F.relu(self.fc_p_layers[i](p_i_flat))
+            else:
+                p_proj = torch.zeros(T, n_fc, device=device)
+
+            if self.fc_m_layers[i] is not None and n_n:
+                m_proj = F.relu(self.fc_m_layers[i](m_i_flat))
+            else:
+                m_proj = torch.zeros(T, n_fc, device=device)
+
+            s_all_T_3fc = torch.cat([s_x, p_proj, m_proj], dim=1)             # (T,3*n_fc)
+            s_cat_list.append(s_all_T_3fc)
+
+        # ---- Step 3. 拼回 (T,N,3*n_fc) → flatten (T*N,3*n_fc) ----
+        s_T_N_3fc = torch.stack(s_cat_list, dim=1)           # (T,N,3*n_fc)
+        return s_T_N_3fc.reshape(T*N, 3*n_fc)
+
 
     def _apply_gat(self, s_flat_TN_D):
         s_block_input = s_flat_TN_D
@@ -603,7 +675,33 @@ class NCMultiAgentPolicy(Policy):
                 logging.error(f"[{self.name}] GAT layer specified (use_gat=True) but GAT layer object is None (likely due to import error or config).")
         return s_all_processed_flat
 
-    def _run_comm_layers(self, obs_T_N_Do, dones_T_N, fps_T_N_Dfp, initial_states_N_2H):
+    def _run_comm_layers(self,
+                         obs_T_N_Do,
+                         dones_T_N=None,
+                         fps_T_N_Dfp=None,
+                         initial_states_N_2H=None):
+        # ── NEW: 自動填補缺省的 dones / fps / 初始 hidden ───────────────
+        if dones_T_N is None:
+            # All-False → 代表持續序列
+            dones_T_N = torch.zeros(obs_T_N_Do.size(0),
+                                    obs_T_N_Do.size(1),
+                                    dtype=torch.bool,
+                                    device=obs_T_N_Do.device)
+        if fps_T_N_Dfp is None:
+            # 若無鄰居 fingerprint，可用 0 占位；shape 保持 (T,N,0) 即可
+            # Ensure the dimension for fingerprints (Dfp) is 0 if not provided.
+            # The _get_comm_s method might expect a specific shape for fps,
+            # so if it's critical, this might need adjustment based on its usage.
+            # For now, assuming a 0-dim fingerprint if None.
+            fps_T_N_Dfp = torch.zeros(obs_T_N_Do.size(0),
+                                      obs_T_N_Do.size(1),
+                                      0, # Assuming 0 features for fingerprint if None
+                                      device=obs_T_N_Do.device)
+        if initial_states_N_2H is None:
+            H = self.n_h
+            N_agents = obs_T_N_Do.size(1)
+            initial_states_N_2H = torch.zeros(N_agents, 2*H, device=obs_T_N_Do.device)
+        
         T, N, _ = obs_T_N_Do.shape
         device = obs_T_N_Do.device
 

@@ -509,7 +509,6 @@ class MA2PPO_NC(MA2C_NC):
         # Patch-03: Remove transpositions. Data from buffer is already (T, N, ...)
         obs_tm   = torch.from_numpy(obs).to(device).float()
         fps_tm   = torch.from_numpy(fps).to(device).float()
-        lstm_states_tm = torch.from_numpy(lstm_states).to(device).float()
         act_tm   = torch.from_numpy(actions).to(device).long()
         oldlp_tm = torch.from_numpy(old_logps).to(device).float()
         ret_tm   = torch.from_numpy(returns).to(device).float()
@@ -523,6 +522,19 @@ class MA2PPO_NC(MA2C_NC):
         total_steps = T
         sum_pl = sum_vl = sum_el = updates = 0
 
+        # ---------- freeze dropout but 保留 train() ----------
+        gat_orig_p  = None
+        lstm_orig_p = None
+        if hasattr(self.policy, 'gat_layer'):
+            gat_orig_p = float(self.policy.gat_layer.dropout)
+            self.policy.gat_layer.dropout = 0.0
+        if hasattr(self.policy, 'lstm_layer'):
+            lstm_orig_p = float(self.policy.lstm_layer.dropout)
+            self.policy.lstm_layer.dropout = 0.0
+
+        # ----- ❶ 進入確定性前向 -----
+        was_training = self.policy.training      # 保留，但不切 eval()
+
         for _ in range(self.ppo_epochs):
             idx_perm = torch.randperm(total_steps, device=device)
             for start in range(0, total_steps, mb_size):
@@ -534,15 +546,14 @@ class MA2PPO_NC(MA2C_NC):
                 mb_ret    = ret_tm[mb_idx]
                 mb_adv    = adv_tm[mb_idx]
                 mb_val    = val_tm[mb_idx]
-                mb_lstm_states = lstm_states_tm[mb_idx] # Slice LSTM states for minibatch (mb_size, N, 2H)
                 
 
-                # Patch M: Vectorized call to policy evaluation
-                newlp, newv, ent = self.policy.evaluate_actions_values_and_entropy(
+                # Vectorized call to policy evaluation
+                # Pass mb_fps, lstm_states defaults to None
+                newlp, newv, ent, _ = self.policy.evaluate_actions_values_and_entropy(
                     mb_obs,          # (mb_size, N, obs_dim)
                     mb_fps,          # (mb_size, N, fp_dim)
-                    mb_act,          # (mb_size, N)
-                    mb_lstm_states   # (mb_size, N, 2H)
+                    mb_act           # (mb_size, N)
                 )
                 # newlp, newv, ent are expected to be (mb_size, N)
                 
@@ -574,6 +585,12 @@ class MA2PPO_NC(MA2C_NC):
                 sum_vl += vloss.item()
                 sum_el += eloss.item()
                 updates += 1
+
+        # ---------- 恢復原來的 dropout ----------
+        if gat_orig_p is not None:
+            self.policy.gat_layer.dropout = gat_orig_p
+        if lstm_orig_p is not None:
+            self.policy.lstm_layer.dropout = lstm_orig_p
 
         if self.lr_decay!='constant' and global_step is not None:
             self._update_lr(global_step)
