@@ -1,4 +1,3 @@
-
 ##root(utils.py)
 from functools import total_ordering
 import itertools
@@ -172,35 +171,48 @@ class Trainer():
             self.gat_dropout_final = 0.1
             self.gat_dropout_decay_steps = 500000
 
-    def _log_episode(self, global_step, mean_reward, std_reward, env_stats):
+    def _log_episode(self, global_step, mean_reward, std_reward, env_stats=None): # 建議 env_stats 預設為 None
         """
         Log episode-level statistics to console / TensorBoard.
-
-        Args
-        ----
-        global_step : int              current environment step
-        mean_reward : float | np.array mean episode reward
-        std_reward  : float | np.array std of episode reward
-        env_stats   : dict             any extra stats collected from env
+        Ensures continuity with pre-PPO TensorBoard tags.
         """
-        if hasattr(self, 'summary_writer') and self.summary_writer is not None:
-            self.summary_writer.add_scalar('episode/mean_reward', mean_reward, global_step)
-            self.summary_writer.add_scalar('episode/std_reward',  std_reward,  global_step)
-            # write additional environment stats if provided
-            if isinstance(env_stats, dict):
-                for k, v in env_stats.items():
-                    self.summary_writer.add_scalar(f'episode/{k}', v, global_step)
+        # For DataFrame data logging
+        log = {'agent': self.agent,
+               'step': global_step,
+               'test_id': -1, # Assuming -1 indicates training episode
+               'avg_reward': mean_reward,
+               'std_reward': std_reward}
+        if isinstance(env_stats, dict):
+            log.update(env_stats) # Add env_stats to the log dictionary
+        self.data.append(log) # Ensure self.data is populated for df.to_csv
 
-        # 可選：印到 console 或 logging
-        logging.info(f"[Ep @ step {global_step}]  "
-                     f"meanR={mean_reward:.3f} ± {std_reward:.3f}  "
-                     + " ".join([f"{k}={v:.3f}" for k, v in (env_stats or {}).items()]))
+        if hasattr(self, 'summary_writer') and self.summary_writer is not None:
+            # 恢復記錄 'train_reward' (通過 _add_summary)
+            self._add_summary(mean_reward, global_step, is_train=True) # is_train=True 會使用 'train_reward' 標籤
+
+            # 恢復使用 'Perf/' 前綴記錄回合標準差和其他環境統計數據
+            self.summary_writer.add_scalar('Perf/EpisodeReward_Std', std_reward, global_step=global_step)
+            if isinstance(env_stats, dict):
+                for key, value in env_stats.items():
+                    self.summary_writer.add_scalar(f'Perf/{key}', value, global_step=global_step)
+            
+            self.summary_writer.flush() # 可選：如果您希望每次回合結束都立即刷新
+
+        # 控制台日誌記錄 (保持不變或按需調整格式)
+        log_message_parts = [
+            f"meanR={mean_reward:.3f} ± {std_reward:.3f}"
+        ]
+        if isinstance(env_stats, dict):
+            log_message_parts.extend([f"{k}={v:.3f}" for k, v in env_stats.items()])
+        
+        logging.info(f"[Ep @ step {global_step}]  " + "  ".join(log_message_parts))
 
     def _add_summary(self, reward, global_step, is_train=True):
-        if is_train:
-            self.summary_writer.add_scalar('train_reward', reward, global_step=global_step)
-        else:
-            self.summary_writer.add_scalar('test_reward', reward, global_step=global_step)
+        if hasattr(self, 'summary_writer') and self.summary_writer is not None: # 添加對 summary_writer 的檢查
+            if is_train:
+                self.summary_writer.add_scalar('train_reward', reward, global_step=global_step)
+            else:
+                self.summary_writer.add_scalar('test_reward', reward, global_step=global_step)
             
     def _add_arrived(self, arrived, global_step, is_train=True):
         if is_train:

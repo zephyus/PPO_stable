@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import os
 import logging
 from agents.utils import batch_to_seq, init_layer, one_hot, run_rnn
+from typing import Optional # Added import
 # Patch: Optional import for torch_geometric
 try:
     from torch_geometric.nn import GATConv
@@ -309,7 +310,7 @@ class NCMultiAgentPolicy(Policy):
     def evaluate_actions_values_and_entropy(
         self,
         obs_B_N_D: torch.Tensor,          # (B, N, obs_dim)
-        fps_B_N_Dfp: torch.Tensor | None, # (B, N, fp_dim)  # Added fps_B_N_Dfp
+        fps_B_N_Dfp: Optional[torch.Tensor], # (B, N, fp_dim)  # Changed type hint
         actions_B_N:    torch.Tensor,     # (B, N, act_dim 或離散 index)
         lstm_states=None                  # 選填: ((1, B*N, H), (1, B*N, H))
     ):
@@ -594,25 +595,50 @@ class NCMultiAgentPolicy(Policy):
                 # 先算展平 index:  t_idx* N + nei_j
                 base  = torch.arange(T, device=device).unsqueeze(1) * N       # (T,1)
                 idx_flat = (base + idx_nei.unsqueeze(0)).reshape(-1)          # (T*n_n,)
-                # → 取鄰居 hidden / obs / fp
+                # → 取鄰居 hidden
                 m_i_flat  = h_repeat[idx_flat].reshape(T, n_n*H)              # (T, n_n*H)
-                nx_i_flat = obs_flat[idx_flat].reshape(T, n_n*Do)             # (T, n_n*Do)
-                if fps_dim:
-                    p_i_flat  = fps_flat[idx_flat].reshape(T, n_n*fps_dim)    # (T,n_n*Dfp)
             else:
                 m_i_flat  = torch.zeros(T, 0, device=device)
-                nx_i_flat = torch.zeros(T, 0, device=device)
-                if fps_dim:
-                    p_i_flat = torch.zeros(T, 0, device=device)
 
             # self.identical 判斷
             if self.identical:
                 x_i_flat  = obs_T_N_Do[:, i, :].reshape(T, Do)                # (T,Do)
+                if n_n:
+                    nx_i_flat = obs_flat[idx_flat].reshape(T, n_n*Do)             # (T, n_n*Do)
+                    if fps_dim:
+                        p_i_flat  = fps_flat[idx_flat].reshape(T, n_n*fps_dim)    # (T,n_n*Dfp)
+                    else:
+                        p_i_flat = torch.zeros(T, 0, device=device)
+                else:
+                    nx_i_flat = torch.zeros(T, 0, device=device)
+                    p_i_flat = torch.zeros(T, 0, device=device)
                 fc_x_in   = torch.cat([x_i_flat, nx_i_flat], dim=1)           # (T, Do + n_n*Do)
-            else:
-                # 異質情況，沿用舊 slice 規則
-                x_i_raw = obs_T_N_Do[:, i, :self.n_s_ls[i]].reshape(T, -1)
-                fc_x_in = torch.cat([x_i_raw, nx_i_flat], dim=1)              # (T, n_ns)
+            else:  # -------- heterogeneous ----------
+                # a) 取自身觀測前 ns_i 維
+                ns_i   = self.n_s_ls[i]
+                x_i_raw = obs_T_N_Do[:, i, :ns_i].reshape(T, ns_i)
+
+                # b) 逐鄰居 slice fingerprint / obs
+                p_seg_ls, nx_seg_ls = [], []
+                for j_nei, nei_id in enumerate(idx_nei):
+                    na_j = self.na_ls_ls[i][j_nei]   # 该邻居 action 維數
+                    ns_j = self.ns_ls_ls[i][j_nei]   # 该邻居 obs   維數
+
+                    idx_flat = (base + nei_id).reshape(-1)        # (T,)
+                    # fingerprint 取前 na_j 維
+                    if fps_dim:
+                        fp_j = fps_flat[idx_flat][:, :na_j]       # (T,na_j)
+                        p_seg_ls.append(fp_j)
+                    # neighbor obs 取前 ns_j 維
+                    nx_j = obs_flat[idx_flat][:, :ns_j]           # (T,ns_j)
+                    nx_seg_ls.append(nx_j)
+
+                # c) Concatenate segments（若無鄰居則空）
+                p_i_flat  = torch.cat(p_seg_ls, dim=1) if p_seg_ls else torch.zeros(T, 0, device=device)
+                nx_i_flat = torch.cat(nx_seg_ls, dim=1) if nx_seg_ls else torch.zeros(T, 0, device=device)
+
+                # d) feed fc_x
+                fc_x_in  = torch.cat([x_i_raw, nx_i_flat], dim=1)     # (T, n_ns)
 
             # ---- 線性層運算 (一次性 T) ----
             fc_x = self._get_fc_x(i, n_n, fc_x_in.size(1))
@@ -680,35 +706,50 @@ class NCMultiAgentPolicy(Policy):
                          dones_T_N=None,
                          fps_T_N_Dfp=None,
                          initial_states_N_2H=None):
-        # ── NEW: 自動填補缺省的 dones / fps / 初始 hidden ───────────────
+        # ─── 新增：搬到 device ───────────────────────────
+        obs_T_N_Do = obs_T_N_Do.to(self.device)
+        if dones_T_N is not None:
+            dones_T_N = dones_T_N.to(self.device)
+        if fps_T_N_Dfp is not None:
+            fps_T_N_Dfp = fps_T_N_Dfp.to(self.device)
+        if initial_states_N_2H is not None:
+            initial_states_N_2H = initial_states_N_2H.to(self.device)
+        # ── 原有填補 default 的程式碼可保留或調整順序 ──
         if dones_T_N is None:
             # All-False → 代表持續序列
-            dones_T_N = torch.zeros(obs_T_N_Do.size(0),
-                                    obs_T_N_Do.size(1),
-                                    dtype=torch.bool,
-                                    device=obs_T_N_Do.device)
+            dones_T_N = torch.zeros(
+                obs_T_N_Do.size(0),
+                obs_T_N_Do.size(1),
+                dtype=torch.bool,
+                device=self.device
+            )
         if fps_T_N_Dfp is None:
             # 若無鄰居 fingerprint，可用 0 占位；shape 保持 (T,N,0) 即可
             # Ensure the dimension for fingerprints (Dfp) is 0 if not provided.
             # The _get_comm_s method might expect a specific shape for fps,
             # so if it's critical, this might need adjustment based on its usage.
             # For now, assuming a 0-dim fingerprint if None.
-            fps_T_N_Dfp = torch.zeros(obs_T_N_Do.size(0),
-                                      obs_T_N_Do.size(1),
-                                      0, # Assuming 0 features for fingerprint if None
-                                      device=obs_T_N_Do.device)
+            fps_T_N_Dfp = torch.zeros(
+                obs_T_N_Do.size(0),
+                obs_T_N_Do.size(1),
+                0, # Assuming 0 features for fingerprint if None
+                device=self.device
+            )
         if initial_states_N_2H is None:
             H = self.n_h
             N_agents = obs_T_N_Do.size(1)
-            initial_states_N_2H = torch.zeros(N_agents, 2*H, device=obs_T_N_Do.device)
+            initial_states_N_2H = torch.zeros(
+                N_agents, 2*H, device=self.device
+            )
+        # ────────────────────────────────────────────────
         
         T, N, _ = obs_T_N_Do.shape
-        device = obs_T_N_Do.device
+        # device = obs_T_N_Do.device # Already self.device
 
-        h0, c0 = torch.chunk(initial_states_N_2H.to(device), 2, dim=1)
+        h0, c0 = torch.chunk(initial_states_N_2H, 2, dim=1) # initial_states_N_2H is already on self.device
 
         if T > 0:
-            initial_done_mask_N = (1.0 - dones_T_N[0].float()).unsqueeze(-1)
+            initial_done_mask_N = (1.0 - dones_T_N[0].float()).unsqueeze(-1) # dones_T_N is on self.device
             h0 = h0 * initial_done_mask_N
             c0 = c0 * initial_done_mask_N
 
