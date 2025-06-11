@@ -70,7 +70,7 @@ class Trainer():
         except ValueError:
             return 0
 
-    def _get_policy(self, ob, done, mode='train'):
+    def _get_policy(self, ob, done, prev_actions=None, mode='train'):
         # prepare outputs
         n = self.env.n_agent
         fps = self.env.get_fingerprint()  # get current fingerprint
@@ -80,7 +80,7 @@ class Trainer():
         env_probs   = [None]*n
 
         if self.agent.startswith('ma2c'):
-            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
+            logits_list, value_list, probs_list = self.model.forward(ob, done, fps, prev_actions)
             for i in range(n):
                 dist = torch.distributions.Categorical(logits=logits_list[i])
                 if mode=='train':
@@ -92,7 +92,7 @@ class Trainer():
                 values_np[i]    = value_list[i].item()
                 env_probs[i]    = probs_list[i].squeeze().cpu().detach().numpy()
         elif self.agent.startswith('mappo'):
-            logits_list, value_list, probs_list = self.model.forward(ob, done, fps)
+            logits_list, value_list, probs_list = self.model.forward(ob, done, fps, prev_actions)
             for i in range(n):
                 dist = torch.distributions.Categorical(logits=logits_list[i])
                 if mode == 'train':
@@ -114,13 +114,14 @@ class Trainer():
 
     def explore(self, prev_ob, prev_done):
         ob, done = prev_ob, prev_done
+        prev_actions = np.zeros(self.env.n_agent, dtype=np.int64)
         for _ in range(self.n_step):
             # get rollout‐start LSTM state before policy.forward updates it
             if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'states_fw'):
                 lstm_state = self.model.policy.states_fw.cpu().numpy()
             else:
                 lstm_state = np.zeros((self.env.n_agent, self.model.policy.n_h * 2))
-            fps, env_probs, actions_np, logp_np, values_np = self._get_policy(ob, done, mode='train')
+            fps, env_probs, actions_np, logp_np, values_np = self._get_policy(ob, done, prev_actions, mode='train')
             self.env.update_fingerprint(env_probs)
             next_ob, reward, done, global_reward = self.env.step(actions_np)
             self.episode_rewards.append(global_reward)
@@ -131,6 +132,7 @@ class Trainer():
             self.model.add_transition(
                 ob, fps, actions_np, reward, values_np, done, logp_np, lstm_state
             )
+            prev_actions = actions_np.copy()
 
             # logging
             self.summary_writer.add_scalar('reward/global_reward', global_reward, gs)
@@ -146,7 +148,7 @@ class Trainer():
         if done:
             Rb = np.zeros(self.env.n_agent)
         else:
-            _, _, _, _, Rb = self._get_policy(ob, done, mode='train')
+            _, _, _, _, Rb = self._get_policy(ob, done, prev_actions, mode='train')
         return ob, done, Rb
 
     def perform(self, test_ind, gui=False):
@@ -155,19 +157,19 @@ class Trainer():
         # note this done is pre-decision to reset LSTM states!
         done = True
         self.model.reset()
+        prev_actions = np.zeros(self.env.n_agent, dtype=np.int64)
         while True:
             if self.agent == 'greedy':
                 action = self.model.forward(ob)
             else:
-                # in on-policy learning, test policy has to be stochastic
                 if self.env.name.startswith('atsc'):
-                    policy, action = self._get_policy(ob, done)
+                    policy, action = self._get_policy(ob, done, prev_actions)
                 else:
-                    # for mission-critic tasks like CACC, we need deterministic policy
-                    policy, action = self._get_policy(ob, done, mode='test')
+                    policy, action = self._get_policy(ob, done, prev_actions, mode='test')
                 self.env.update_fingerprint(policy)
             next_ob, reward, done, global_reward = self.env.step(action)
             rewards.append(global_reward)
+            prev_actions = action.copy() if isinstance(action, np.ndarray) else np.array(action)
             if done:
                 break
             ob = next_ob

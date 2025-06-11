@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import logging
+import threading
 from agents.utils import batch_to_seq, init_layer, one_hot, run_rnn
 from typing import Optional # Added import
 # Patch: Optional import for torch_geometric
@@ -204,32 +205,47 @@ class NCMultiAgentPolicy(Policy):
         self.model_config = model_config
         # Patch: self.use_gat initialization moved before _init_net
         use_gat_env_value = os.getenv('USE_GAT', '1')
-        logging.info(f"DEBUG: os.getenv('USE_GAT', '1') returned: '{use_gat_env_value}' (type: {type(use_gat_env_value)}")
+        logging.info(
+            f"DEBUG: os.getenv('USE_GAT', '1') returned: '{use_gat_env_value}' "
+            f"(type: {type(use_gat_env_value)})"
+        )
         # self.use_gat will be True if GATConv is available AND environment variable is '1'
         self.use_gat = (GATConv is not None) and (use_gat_env_value == '1')
+        # persist this flag in checkpoints to detect mismatches when loading
+        self.register_buffer('use_gat_flag', torch.tensor(int(self.use_gat), dtype=torch.uint8))
         if GATConv is None and use_gat_env_value == '1':
             logging.warning("USE_GAT is '1' but torch_geometric is not installed. GAT will be disabled.")
         
         logging.info(f"DEBUG: self.use_gat evaluated to: {self.use_gat}")
 
         self._init_net() # self.use_gat is now set before this call
+
         self._reset()
         self.zero_pad = nn.Parameter(torch.zeros(1, 2*self.n_fc), requires_grad=False)
         self.latest_attention_scores = None
 
-        # capture device placeholder; real device set when model.to(device) is called
-        # This needs to be after _init_net() as parameters are created there
-        if list(self.parameters()):
-             self.device = next(self.parameters()).device
-        else:
-             # If no parameters (e.g. GAT disabled and no other layers yet)
-             self.device = torch.device("cpu") # Default to CPU
-             logging.warning(f"[{self.name}] No parameters found after _init_net. Defaulting device to CPU.")
+    @property
+    def dev(self):
+        """Current device inferred from parameters."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def load_state_dict(self, state_dict, strict=True):
+        if 'use_gat_flag' in state_dict:
+            loaded = bool(state_dict['use_gat_flag'])
+            if loaded != self.use_gat:
+                raise ValueError(
+                    f"use_gat mismatch: checkpoint expects {loaded} but model is configured with {self.use_gat}"
+                )
+        return super().load_state_dict(state_dict, strict)
+
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
-        obs = torch.from_numpy(obs).float() 
-        fps = torch.from_numpy(fps).float()
+        obs = torch.from_numpy(obs).float().to(self.dev, non_blocking=True)
+        fps = torch.from_numpy(fps).float().to(self.dev, non_blocking=True)
         
         dones_np = np.asarray(dones)
         if dones_np.ndim == 1:
@@ -248,7 +264,9 @@ class NCMultiAgentPolicy(Policy):
         # Patch-04: Replace vs_placeholder with actual values from PPO value heads
         vs_list_N_of_T = []
         for i in range(self.n_agent):
-            val_i_T = self.ppo_value_heads[i](hs_N_T_H[i]).squeeze(-1)
+            critic_input_i = self._build_value_input(hs_N_T_H[i], acts_T_N, i)
+            head = self.ppo_value_heads[0] if self.identical else self.ppo_value_heads[i]
+            val_i_T = head(critic_input_i).squeeze(-1)
             vs_list_N_of_T.append(val_i_T)
         vs_T_N = torch.stack(vs_list_N_of_T, dim=1)
 
@@ -275,7 +293,31 @@ class NCMultiAgentPolicy(Policy):
                 self.entropy_loss,
                 self.loss)
 
-    def forward(self, ob_N_Do, done_N, fp_N_Dfp, action=None, out_type='p'):
+    def forward(self, ob_N_Do, done_N, fp_N_Dfp, neighbor_actions_N=None, action=None, out_type='p'):
+        """Run actor (and optionally critic) for a single timestep.
+
+        Parameters
+        ----------
+        ob_N_Do : np.ndarray
+            Observation array with shape ``(N, obs_dim)``.
+        done_N : np.ndarray
+            Done flags for each agent.
+        fp_N_Dfp : np.ndarray
+            Fingerprint features for each agent.
+        neighbor_actions_N : optional, array-like or Tensor
+            If provided, should contain all agents' actions with shape ``(N,)``.
+            When present, value predictions will be returned; otherwise the
+            second element of the returned tuple will be ``None``.
+
+        Returns
+        -------
+        List[Tensor]
+            Actor logits for each agent.
+        Optional[List[Tensor]]
+            Value estimates if ``neighbor_actions_N`` is given, else ``None``.
+        List[Tensor]
+            Action probabilities for each agent.
+        """
         device = self.actor_heads[0].weight.device
 
         obs_T1_N_Do = torch.from_numpy(ob_N_Do).float().unsqueeze(0).to(device)
@@ -291,19 +333,29 @@ class NCMultiAgentPolicy(Policy):
 
         actor_logits_list_N_of_A = []
         for i in range(self.n_agent):
-            actor_logits_list_N_of_A.append(self.actor_heads[i](h_states_N_H[i, :].unsqueeze(0)))
+            head = self.actor_heads[0] if self.identical else self.actor_heads[i]
+            actor_logits_list_N_of_A.append(head(h_states_N_H[i, :].unsqueeze(0)))
 
-        value_list_N_of_1 = []
-        for i in range(self.n_agent):
-            v_i = self.ppo_value_heads[i](h_states_N_H[i, :].unsqueeze(0)).squeeze(-1)
-            value_list_N_of_1.append(v_i)
+        value_list_N_of_1 = None
+        if neighbor_actions_N is not None:
+            act_tensor = torch.as_tensor(neighbor_actions_N, dtype=torch.long, device=device).unsqueeze(0)
+            value_list_N_of_1 = []
+            for i in range(self.n_agent):
+                h_i = h_states_N_H[i, :].unsqueeze(0)  # (1, H)
+                critic_input_i = self._build_value_input(h_i, act_tensor, i)
+                head = self.ppo_value_heads[0] if self.identical else self.ppo_value_heads[i]
+                v_i = head(critic_input_i).squeeze(-1)
+                value_list_N_of_1.append(v_i)
 
         probs_list_N_of_A = [F.softmax(logits.squeeze(0), dim=-1) for logits in actor_logits_list_N_of_A]
 
-        self.states_fw = new_states_N_2H.detach()
+        self.states_fw = new_states_N_2H.detach().to(device)
 
         actor_logits_squeezed = [lg.squeeze(0) for lg in actor_logits_list_N_of_A]
-        value_list_squeezed = [val.squeeze(0) if val.numel() == 1 else val for val in value_list_N_of_1]
+        if value_list_N_of_1 is not None:
+            value_list_squeezed = [val.squeeze(0) if val.numel() == 1 else val for val in value_list_N_of_1]
+        else:
+            value_list_squeezed = None
 
         return actor_logits_squeezed, value_list_squeezed, probs_list_N_of_A
     
@@ -325,6 +377,8 @@ class NCMultiAgentPolicy(Policy):
         """
         B, N, _ = obs_B_N_D.shape                       # 取 batch 與 agent 數
 
+        actions_B_N = actions_B_N.to(obs_B_N_D.device).long()
+
         # --- 1) 先拿到 (N,B,H) → 轉 (B,N,H) ---
         h_N_B_H, lstm_states_new = self._run_comm_layers(
                 obs_B_N_D,
@@ -337,7 +391,14 @@ class NCMultiAgentPolicy(Policy):
         # --- 2) identical==True 的 logits/metrics 批量處理 ---
         if self.identical:
             logits_B_N_A = self.actor_heads[0](h_B_N_H)        # (B,N,A)
-            values_B_N   = self.ppo_value_heads[0](h_B_N_H).squeeze(-1) # (B,N)
+            critic_inputs_list = [
+                self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
+                for i in range(self.n_agent)
+            ]
+            values_cols = [
+                self.ppo_value_heads[0](ci).squeeze(-1) for ci in critic_inputs_list
+            ]
+            values_B_N = torch.stack(values_cols, dim=1)
 
             flat_logits  = logits_B_N_A.reshape(-1, logits_B_N_A.size(-1)) # (B*N, A)
             flat_actions = actions_B_N.reshape(-1) # (B*N)
@@ -350,9 +411,10 @@ class NCMultiAgentPolicy(Policy):
         else:
             logits_list, values_list = [], []
             for i, (actor_h, value_h) in enumerate(zip(self.actor_heads, self.ppo_value_heads)):
-                # h_B_N_H[:, i, :] gives (B, H) for agent i
                 logits_i_B_A = actor_h(h_B_N_H[:, i, :])            # (B,A_i)
-                values_i_B   = value_h(h_B_N_H[:, i, :]).squeeze(-1) # (B)
+
+                critic_input_i = self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
+                values_i_B = value_h(critic_input_i).squeeze(-1) # (B)
                 logits_list.append(logits_i_B_A)
                 values_list.append(values_i_B)
 
@@ -412,14 +474,16 @@ class NCMultiAgentPolicy(Policy):
 
         # ── project fingerprints safely ──
         if n_n > 0 and self.fc_p_layers[i] is not None and p_cat_for_fc is not None:
-            if p_cat_for_fc.size(1) == self.fc_p_layers[i].in_features:
-                p_proj = F.relu(self.fc_p_layers[i](p_cat_for_fc.to(device)))
-            else:
+            in_dim = self.fc_p_layers[i].in_features
+            if p_cat_for_fc.size(1) > in_dim:
                 logging.warning(
-                    f"Agent {i}: fc_p_layer.in_features={self.fc_p_layers[i].in_features}, "
-                    f"got {p_cat_for_fc.size(1)} → zeros fallback."
+                    f"Agent {i}: fingerprint dim {p_cat_for_fc.size(1)} exceeds {in_dim}, truncating"
                 )
-                p_proj = torch.zeros(1, self.n_fc, device=device)
+                p_cat_for_fc = p_cat_for_fc[:, :in_dim]
+            elif p_cat_for_fc.size(1) < in_dim:
+                pad = torch.zeros(1, in_dim - p_cat_for_fc.size(1), device=device)
+                p_cat_for_fc = torch.cat([p_cat_for_fc, pad], dim=1)
+            p_proj = F.relu(self.fc_p_layers[i](p_cat_for_fc.to(device)))
         else:
             # no neighbors or no valid fingerprint → zeros
             p_proj = torch.zeros(1, self.n_fc, device=device)
@@ -445,22 +509,97 @@ class NCMultiAgentPolicy(Policy):
                 na_ls.append(self.n_a_ls[j])
             return n_n, self.n_s_ls[i_agent] + sum(ns_ls), sum(na_ls), ns_ls, na_ls
 
+    def _build_value_input(self, h_tensor, actions_tensor, agent_id):
+        """Construct critic input by concatenating one-hot neighbor actions.
+
+        Parameters
+        ----------
+        h_tensor : torch.Tensor
+            Hidden states for agent ``agent_id`` with shape ``(B_or_T, H)``.
+        actions_tensor : torch.Tensor or None
+            Tensor containing all agents' actions with shape ``(B_or_T, N)``. If
+            ``None`` a zero placeholder will be used for neighbor actions.
+        agent_id : int
+            Which agent's neighbor configuration to use.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(B_or_T, H + n_na)`` suitable for the
+            corresponding value head.
+        """
+
+        _, _, n_na, _, _ = self._get_neighbor_dim(agent_id)
+        if n_na == 0:
+            return h_tensor
+
+        device = h_tensor.device
+        dtype = h_tensor.dtype
+        if self.identical:
+            target_dim = self.ppo_value_heads[0].in_features - self.n_h
+        else:
+            target_dim = n_na
+
+        if actions_tensor is None:
+            pad = torch.zeros(h_tensor.size(0), target_dim, device=device, dtype=dtype)
+            return torch.cat([h_tensor, pad], dim=1)
+
+        neighbor_indices = self.neighbor_index_ls[agent_id].to(actions_tensor.device)
+        if neighbor_indices.numel() == 0:
+            pad = torch.zeros(h_tensor.size(0), target_dim, device=actions_tensor.device, dtype=dtype)
+            return torch.cat([h_tensor, pad], dim=1)
+
+        if self.identical:
+            neighbor_actions = actions_tensor[:, neighbor_indices]
+            neighbor_actions = neighbor_actions.clamp(0, self.n_a - 1)
+            one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).to(dtype)
+            flat = one_hot.view(h_tensor.size(0), -1)
+            if flat.size(1) > target_dim:
+                logging.warning(
+                    f"[Agent {agent_id}] one-hot overflow {flat.size(1)}>{target_dim}, truncating."
+                )
+                flat = flat[:, :target_dim]
+            elif flat.size(1) < target_dim:
+                pad_dim = target_dim - flat.size(1)
+                padding = torch.zeros(h_tensor.size(0), pad_dim, device=device, dtype=dtype)
+                flat = torch.cat([flat, padding], dim=1)
+            assert flat.size(1) == target_dim
+            return torch.cat([h_tensor, flat], dim=1)
+        else:
+            segs = []
+            for k, n_id in enumerate(neighbor_indices):
+                act = actions_tensor[:, n_id]
+                n_dim = self.na_ls_ls[agent_id][k]
+                act = act.clamp(0, n_dim - 1)
+                seg = F.one_hot(act, num_classes=n_dim).to(dtype)
+                segs.append(seg)
+            cat = (
+                torch.cat(segs, dim=1)
+                if segs
+                else torch.zeros(h_tensor.size(0), 0, device=actions_tensor.device, dtype=dtype)
+            )
+            if cat.size(1) > target_dim:
+                logging.warning(
+                    f"[Agent {agent_id}] one-hot overflow {cat.size(1)}>{target_dim}, truncating."
+                )
+                cat = cat[:, :target_dim]
+            elif cat.size(1) < target_dim:
+                pad = torch.zeros(h_tensor.size(0), target_dim - cat.size(1), device=device, dtype=dtype)
+                cat = torch.cat([cat, pad], dim=1)
+            assert cat.size(1) == target_dim
+            return torch.cat([h_tensor, cat], dim=1)
+
     def _init_actor_head(self, n_a):
         actor_head = nn.Linear(self.n_h, n_a)
         init_layer(actor_head, 'fc')
         self.actor_heads.append(actor_head)
 
-    def _init_critic_head(self, n_na):
-        critic_head = nn.Linear(self.n_h + n_na, 1)
-        init_layer(critic_head, 'fc')
-        self.critic_heads.append(critic_head)
-
     def _init_net(self):
+        self._fc_x_lock = threading.Lock()
         self.fc_x_layers = nn.ModuleDict()
         self.fc_p_layers = nn.ModuleList()
         self.fc_m_layers = nn.ModuleList()
         self.actor_heads = nn.ModuleList()
-        self.critic_heads = nn.ModuleList()
         self.ppo_value_heads = nn.ModuleList()
         self.ns_ls_ls = []
         self.na_ls_ls = []
@@ -485,7 +624,10 @@ class NCMultiAgentPolicy(Policy):
                 dropout=gat_dropout_init
             )
             adj_matrix = torch.tensor(self.neighbor_mask, dtype=torch.float32)
-            adj_matrix = adj_matrix + torch.eye(adj_matrix.size(0), dtype=torch.float32)
+            adj_matrix = torch.maximum(
+                adj_matrix,
+                torch.eye(adj_matrix.size(0), dtype=torch.float32)
+            )
             edge_index = adj_matrix.nonzero(as_tuple=False).t().contiguous()
             self.register_buffer('edge_index', edge_index.long())
 
@@ -502,13 +644,27 @@ class NCMultiAgentPolicy(Policy):
             logging.warning(f"[{self.name}] GAT is configured (use_gat=True) but GAT layer object is None (likely due to import error or config).")
 
 
+        max_n_na = 0
+        if self.identical:
+            # compute maximum neighbour-action dimension among all agents
+            dims = [self._get_neighbor_dim(i)[2] for i in range(self.n_agent)]
+            if dims:
+                max_n_na = max(dims)
+            self.shared_value_head = nn.Linear(self.n_h + max_n_na, 1)
+            init_layer(self.shared_value_head, 'fc')
+            self._init_actor_head(self.n_a)
+            self.ppo_value_heads = nn.ModuleList([self.shared_value_head])
+
         for i in range(self.n_agent):
             n_n, n_ns, n_na, ns_ls, na_ls = self._get_neighbor_dim(i)
             self.ns_ls_ls.append(ns_ls)
             self.na_ls_ls.append(na_ls)
             self.n_n_ls.append(n_n)
             if n_n:
-                fc_p_layer = nn.Linear(n_na, self.n_fc)
+                max_dim = n_na
+                if self.identical:
+                    max_dim = max_n_na
+                fc_p_layer = nn.Linear(max_dim, self.n_fc)
                 init_layer(fc_p_layer, 'fc')
                 fc_m_layer = nn.Linear(self.n_h * n_n, self.n_fc)
                 init_layer(fc_m_layer, 'fc')
@@ -518,48 +674,33 @@ class NCMultiAgentPolicy(Policy):
                 self.fc_m_layers.append(None)
                 self.fc_p_layers.append(None)
 
-            n_a = self.n_a if self.identical else self.n_a_ls[i]
-            self._init_actor_head(n_a)
-            self._init_critic_head(n_na)
+            if not self.identical:
+                n_a = self.n_a_ls[i]
+                self._init_actor_head(n_a)
+                ppo_v = nn.Linear(self.n_h + n_na, 1)
+                init_layer(ppo_v, 'fc')
+                self.ppo_value_heads.append(ppo_v)
 
-            ppo_v = nn.Linear(self.n_h, 1)
-            init_layer(ppo_v, 'fc')
-            self.ppo_value_heads.append(ppo_v)
-
-        if list(self.parameters()):
-            self.device = next(self.parameters()).device
-        else:
+        if not list(self.parameters()):
             logging.warning(f"[{self.name}] cannot infer device in _init_net.")
 
         # Cache neighbor indices as a list of LongTensors
-        self.neighbor_index_ls = [
-            torch.from_numpy(np.where(mask)[0]).long()
-            for mask in self.neighbor_mask
-        ]
-        # Note: These tensors in neighbor_index_ls are on CPU by default.
-        # They will be moved to the correct device in _get_comm_s using .to(device).
+        self.neighbor_index_ls = []
+        for idx, mask in enumerate(self.neighbor_mask):
+            tensor = torch.from_numpy(np.where(mask)[0]).long()
+            self.register_buffer(f'neighbor_index_{idx}', tensor)
+            self.neighbor_index_ls.append(tensor)
 
     def _reset(self):
-        if not hasattr(self, 'device') or self.device is None:
-            logging.error(f"Device not properly set for NCMultiAgentPolicy instance {self.name} during _reset. Attempting to infer or defaulting to CPU.")
-            try:
-                current_device = next(self.parameters()).device
-                logging.info(f"Inferred device {current_device} for {self.name} in _reset.")
-                self.device = current_device
-            except StopIteration:
-                logging.error(f"Could not infer device for {self.name} from parameters in _reset. Defaulting to CPU.")
-                current_device = torch.device("cpu")
-                self.device = current_device
-        else:
-            current_device = self.device
-
+        current_device = self.dev
         self.states_fw = torch.zeros(self.n_agent, self.n_h * 2, device=current_device)
         self.states_bw = torch.zeros(self.n_agent, self.n_h * 2, device=current_device)
 
     def _run_actor_heads(self, hs, detach=False):
         logits_list = []
         for i in range(self.n_agent):
-            logits_i = self.actor_heads[i](hs[i])
+            head = self.actor_heads[0] if self.identical else self.actor_heads[i]
+            logits_i = head(hs[i])
             if detach:
                 logits_list.append(logits_i.cpu().detach().numpy())
             else:
@@ -593,7 +734,12 @@ class NCMultiAgentPolicy(Policy):
             # gather neighbor h, obs, fp  —— 利用 flatten trick
             if n_n:
                 # 先算展平 index:  t_idx* N + nei_j
-                base  = torch.arange(T, device=device).unsqueeze(1) * N       # (T,1)
+                if not hasattr(self, '_arange_cache'):
+                    self._arange_cache = {}
+                key = (T, device)
+                if key not in self._arange_cache:
+                    self._arange_cache[key] = torch.arange(T, device=device).unsqueeze(1)
+                base  = self._arange_cache[key] * N       # (T,1)
                 idx_flat = (base + idx_nei.unsqueeze(0)).reshape(-1)          # (T*n_n,)
                 # → 取鄰居 hidden
                 m_i_flat  = h_repeat[idx_flat].reshape(T, n_n*H)              # (T, n_n*H)
@@ -646,6 +792,15 @@ class NCMultiAgentPolicy(Policy):
 
             # fingerprint / hidden‐msg 投影
             if n_n and self.fc_p_layers[i] is not None and fps_dim:
+                in_dim = self.fc_p_layers[i].in_features
+                if p_i_flat.size(1) > in_dim:
+                    logging.warning(
+                        f"Agent {i}: fingerprint dim {p_i_flat.size(1)} exceeds {in_dim}, truncating"
+                    )
+                    p_i_flat = p_i_flat[:, :in_dim]
+                elif p_i_flat.size(1) < in_dim:
+                    pad = torch.zeros(T, in_dim - p_i_flat.size(1), device=device)
+                    p_i_flat = torch.cat([p_i_flat, pad], dim=1)
                 p_proj = F.relu(self.fc_p_layers[i](p_i_flat))
             else:
                 p_proj = torch.zeros(T, n_fc, device=device)
@@ -667,6 +822,8 @@ class NCMultiAgentPolicy(Policy):
         s_block_input = s_flat_TN_D
         # Patch: Update GAT condition
         if self.use_gat and self.gat_layer is not None:
+            if s_flat_TN_D.numel() == 0:
+                return s_flat_TN_D
             if self.use_layer_norm and hasattr(self, 'pre_gat_ln'):
                 s_input_for_gat = self.pre_gat_ln(s_block_input)
             else:
@@ -678,10 +835,14 @@ class NCMultiAgentPolicy(Policy):
             if s_flat_TN_D.shape[0] % num_nodes_per_graph != 0:
                 raise ValueError("s_flat_TN_D cannot be reshaped to (T,N,D) for batched GAT processing.")
 
-            edge_index_list = []
-            for i in range(num_graphs):
-                edge_index_list.append(self.edge_index + i * num_nodes_per_graph)
-            batched_edge_index = torch.cat(edge_index_list, dim=1).to(s_input_for_gat.device)
+            if not hasattr(self, '_edge_index_cache'):
+                self._edge_index_cache = {}
+            if num_graphs not in self._edge_index_cache:
+                edge_index_list = [
+                    self.edge_index + i * num_nodes_per_graph for i in range(num_graphs)
+                ]
+                self._edge_index_cache[num_graphs] = torch.cat(edge_index_list, dim=1)
+            batched_edge_index = self._edge_index_cache[num_graphs].to(s_input_for_gat.device)
 
             s_after_gat = self.gat_layer(s_input_for_gat, batched_edge_index)
 
@@ -707,13 +868,13 @@ class NCMultiAgentPolicy(Policy):
                          fps_T_N_Dfp=None,
                          initial_states_N_2H=None):
         # ─── 新增：搬到 device ───────────────────────────
-        obs_T_N_Do = obs_T_N_Do.to(self.device)
+        obs_T_N_Do = obs_T_N_Do.to(self.dev)
         if dones_T_N is not None:
-            dones_T_N = dones_T_N.to(self.device)
+            dones_T_N = dones_T_N.to(self.dev)
         if fps_T_N_Dfp is not None:
-            fps_T_N_Dfp = fps_T_N_Dfp.to(self.device)
+            fps_T_N_Dfp = fps_T_N_Dfp.to(self.dev)
         if initial_states_N_2H is not None:
-            initial_states_N_2H = initial_states_N_2H.to(self.device)
+            initial_states_N_2H = initial_states_N_2H.to(self.dev)
         # ── 原有填補 default 的程式碼可保留或調整順序 ──
         if dones_T_N is None:
             # All-False → 代表持續序列
@@ -721,7 +882,7 @@ class NCMultiAgentPolicy(Policy):
                 obs_T_N_Do.size(0),
                 obs_T_N_Do.size(1),
                 dtype=torch.bool,
-                device=self.device
+                device=self.dev
             )
         if fps_T_N_Dfp is None:
             # 若無鄰居 fingerprint，可用 0 占位；shape 保持 (T,N,0) 即可
@@ -733,23 +894,22 @@ class NCMultiAgentPolicy(Policy):
                 obs_T_N_Do.size(0),
                 obs_T_N_Do.size(1),
                 0, # Assuming 0 features for fingerprint if None
-                device=self.device
+                device=self.dev
             )
         if initial_states_N_2H is None:
             H = self.n_h
             N_agents = obs_T_N_Do.size(1)
             initial_states_N_2H = torch.zeros(
-                N_agents, 2*H, device=self.device
+                N_agents, 2*H, device=self.dev
             )
         # ────────────────────────────────────────────────
         
         T, N, _ = obs_T_N_Do.shape
-        # device = obs_T_N_Do.device # Already self.device
 
-        h0, c0 = torch.chunk(initial_states_N_2H, 2, dim=1) # initial_states_N_2H is already on self.device
+        h0, c0 = torch.chunk(initial_states_N_2H, 2, dim=1)
 
         if T > 0:
-            initial_done_mask_N = (1.0 - dones_T_N[0].float()).unsqueeze(-1) # dones_T_N is on self.device
+            initial_done_mask_N = (1.0 - dones_T_N[0].float()).unsqueeze(-1)
             h0 = h0 * initial_done_mask_N
             c0 = c0 * initial_done_mask_N
 
@@ -772,16 +932,17 @@ class NCMultiAgentPolicy(Policy):
 
     def _get_fc_x(self, agent_id: int, n_n: int, n_ns: int) -> nn.Linear:
         key = f'agent_{agent_id}_nn_{n_n}_in{n_ns}'
-        if key not in self.fc_x_layers:
-            logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
-            layer = nn.Linear(n_ns, self.n_fc)
-            init_layer(layer, 'fc')
-            layer = layer.to(self.zero_pad.device)
-            self.fc_x_layers[key] = layer
-        else:
-            assert self.fc_x_layers[key].in_features == n_ns, \
-                f"fc_x[{key}] expects {self.fc_x_layers[key].in_features}, got {n_ns}"
-        return self.fc_x_layers[key]
+        with self._fc_x_lock:
+            if key not in self.fc_x_layers:
+                logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
+                layer = nn.Linear(n_ns, self.n_fc)
+                init_layer(layer, 'fc')
+                layer = layer.to(self.dev)
+                self.fc_x_layers[key] = layer
+            else:
+                assert self.fc_x_layers[key].in_features == n_ns, \
+                    f"fc_x[{key}] expects {self.fc_x_layers[key].in_features}, got {n_ns}"
+            return self.fc_x_layers[key]
 
 
 class NCLMMultiAgentPolicy(NCMultiAgentPolicy):
