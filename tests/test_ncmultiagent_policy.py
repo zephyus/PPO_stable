@@ -75,13 +75,37 @@ def test_forward_outputs(dummy_policy):
     logits_list, value_list, prob_list = dummy_policy.forward(ob, done, fp)
 
     assert isinstance(logits_list, list) and len(logits_list) == N
-    assert isinstance(value_list,  list) and len(value_list)  == N
+    assert value_list is None
     assert isinstance(prob_list,   list) and len(prob_list)   == N
 
     for lg in logits_list:
         assert lg.shape[-1] == dummy_policy.n_a
     for p in prob_list:
         assert torch.allclose(p.sum(), torch.tensor(1.0, device=p.device), atol=1e-5)
+
+def test_forward_with_actions(dummy_policy):
+    N = dummy_policy.n_agent
+    ob   = torch.randn(N, dummy_policy.n_s).cpu().numpy()
+    done = torch.zeros(N, dtype=torch.bool).cpu().numpy()
+    fp   = torch.zeros((N, 0), dtype=torch.float32).cpu().numpy()
+    actions = torch.zeros(N, dtype=torch.long)
+
+    logits_list, value_list, prob_list = dummy_policy.forward(ob, done, fp, actions)
+
+    assert isinstance(logits_list, list) and len(logits_list) == N
+    assert isinstance(value_list,  list) and len(value_list)  == N
+    assert isinstance(prob_list,   list) and len(prob_list)   == N
+
+def test_critic_input_padding(dummy_policy):
+    B = 2
+    N = dummy_policy.n_agent
+    h = torch.zeros(B, dummy_policy.n_h)
+    acts = torch.zeros(B, N, dtype=torch.long)
+
+    expected_dim = dummy_policy.shared_value_head.in_features
+    for i in range(N):
+        inp = dummy_policy._build_value_input(h, acts, i)
+        assert inp.size(1) == expected_dim
 
 def test_backward_computes_loss_and_grad(dummy_policy):
     agent = dummy_policy
