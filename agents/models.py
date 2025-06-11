@@ -165,8 +165,7 @@ class IA2C:
         #先叫出一個policy，然後把它丟進GPU or CPU去跑 🆒
         self.policy = self._init_policy()
         self.policy.to(self.device)
-        # --- 同步 device 欄位並重建 hidden states 在正確裝置 ---
-        self.policy.device = self.device
+        # --- 重建 hidden states 在正確裝置 ---
         if hasattr(self.policy, "_reset"):
             self.policy._reset()
         
