@@ -245,6 +245,14 @@ class NCMultiAgentPolicy(Policy):
                 )
         return super().load_state_dict(state_dict, strict)
 
+    def _get_dist(self, logits: torch.Tensor):
+        """Return a categorical distribution for the given logits.
+
+        Tests dynamically monkeypatch this method, but a default implementation
+        avoids ``AttributeError`` when the policy is used directly.
+        """
+        return torch.distributions.Categorical(logits=logits)
+
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
