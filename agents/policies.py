@@ -87,6 +87,19 @@ class Policy(nn.Module):
         summary_writer.add_scalar('loss/{}_total_loss'.format(self.name), self.loss,
                                   global_step=global_step)
 
+    @property
+    def dev(self):
+        """Current device inferred from parameters."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    @property
+    def device(self):
+        """Alias of :pyattr:`dev` for backward compatibility."""
+        return self.dev
+
 
 class LstmPolicy(Policy):
     def __init__(self, n_s, n_a, n_n, n_step, n_fc=64, n_lstm=64, name=None,
@@ -221,16 +234,7 @@ class NCMultiAgentPolicy(Policy):
         self._init_net() # self.use_gat is now set before this call
 
         self._reset()
-        self.zero_pad = nn.Parameter(torch.zeros(1, 2*self.n_fc), requires_grad=False)
         self.latest_attention_scores = None
-
-    @property
-    def dev(self):
-        """Current device inferred from parameters."""
-        try:
-            return next(self.parameters()).device
-        except StopIteration:
-            return torch.device("cpu")
 
     def load_state_dict(self, state_dict, strict=True):
         if 'use_gat_flag' in state_dict:
@@ -958,7 +962,6 @@ class ConsensusPolicy(NCMultiAgentPolicy):
                  n_s_ls=None, n_a_ls=None, model_config=None, identical=True):
         super(ConsensusPolicy, self).__init__(n_s, n_a, n_agent, n_step, neighbor_mask, n_fc, n_h,
                                              n_s_ls, n_a_ls, model_config, identical)
-        self.zero_pad = nn.Parameter(torch.zeros(1, 2 * self.n_fc), requires_grad=False)
 
     def consensus_update(self):
         consensus_update = []
