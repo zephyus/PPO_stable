@@ -189,6 +189,24 @@ tensorboard --logdir=/home/russell512/my_deeprl_network_ori_test_0516_multi_head
 
 請將上述路徑替換為您在主機上對應的專案路徑和實驗輸出路徑。然後在瀏覽器中打開 TensorBoard 提供的 URL (通常是 `http://localhost:6006`)。
 
+### 訓練指標解讀
+
+以下是訓練過程中較為重要的 TensorBoard 指標，以及常見的觀察方式：
+
+| 標籤 | 說明 |
+| --- | --- |
+| `train_reward` | 每回合的平均回報，持續上升通常表示策略正在改善。 |
+| `Perf/EpisodeReward_Std` | 回報的標準差，若過大代表策略表現不穩定。 |
+| `{name}/ppo_actor_loss` | 策略梯度（Actor）損失，長期趨於 0 通常意味著策略已穩定。 |
+| `{name}/ppo_critic_loss` | 值函數（Critic）損失，可觀察其是否逐漸下降。 |
+| `{name}/ppo_entropy_loss` | 負熵，值愈大代表策略愈隨機。 |
+| `train/grad_norm_before_clip` | 每次更新前的梯度 L2 範數。 |
+| `train/grad_norm_after_clip` | 施行 `clip_grad_norm_` 後的梯度範數。 |
+| `train/grad_norm_ratio` | `grad_norm_before_clip / max_grad_norm`，若經常大於 1 代表梯度常被裁剪。 |
+| `train/clip_factor` | `grad_norm_after_clip / grad_norm_before_clip`，越接近 0 代表裁剪越嚴重。 |
+
+您可以透過觀察 `grad_norm_ratio` 是否大於 1，以及 `clip_factor` 的變化，判斷梯度裁剪對學習的影響。若長期處於裁剪狀態，可考慮調整 `max_grad_norm` 或學習率。
+
 ## 重新連接到訓練會話
 
 如果您想查看正在運行的訓練日誌或進行其他操作：

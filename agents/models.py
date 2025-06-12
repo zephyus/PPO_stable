@@ -520,6 +520,7 @@ class MA2PPO_NC(MA2C_NC):
 
         total_steps = T
         sum_pl = sum_vl = sum_el = updates = 0
+        sum_pre_gn = sum_post_gn = 0.0
 
         # ---------- freeze dropout but 保留 train() ----------
         gat_orig_p  = None
@@ -576,8 +577,27 @@ class MA2PPO_NC(MA2C_NC):
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                if self.max_grad_norm>0:
+
+                pre_clip_gn = 0.0
+                for p in self.policy.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        pre_clip_gn += param_norm.item() ** 2
+                pre_clip_gn = pre_clip_gn ** 0.5
+
+                if self.max_grad_norm > 0:
                     nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
+                post_clip_gn = 0.0
+                for p in self.policy.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        post_clip_gn += param_norm.item() ** 2
+                post_clip_gn = post_clip_gn ** 0.5
+
+                sum_pre_gn += pre_clip_gn
+                sum_post_gn += post_clip_gn
+
                 self.optimizer.step()
 
                 sum_pl += ploss.item()
@@ -603,5 +623,12 @@ class MA2PPO_NC(MA2C_NC):
             summary_writer.add_scalar(f'{self.name}/ppo_critic_loss', avg_vl, global_step)
             summary_writer.add_scalar(f'{self.name}/ppo_entropy_loss', avg_el, global_step)
             summary_writer.add_scalar(f'{self.name}/ppo_total_loss', avg_total, global_step)
+            avg_pre_gn = sum_pre_gn / updates
+            avg_post_gn = sum_post_gn / updates
+            summary_writer.add_scalar('train/grad_norm_before_clip', avg_pre_gn, global_step)
+            summary_writer.add_scalar('train/grad_norm_after_clip', avg_post_gn, global_step)
+            if self.max_grad_norm > 0:
+                summary_writer.add_scalar('train/grad_norm_ratio', avg_pre_gn / self.max_grad_norm, global_step)
+                summary_writer.add_scalar('train/clip_factor', avg_post_gn / (avg_pre_gn + 1e-8), global_step)
             return avg_pl, avg_vl, avg_el, avg_total
         return 0.0,0.0,0.0,0.0

@@ -113,3 +113,16 @@ def test_mappo_update_smoke(dummy_mappo):
     changed = any(not torch.allclose(wb, p)
                   for wb, p in zip(ws_before, dummy_mappo.policy.parameters()))
     assert changed, "Policy parameters should have been updated"
+
+def test_mappo_logs_grad_norm(dummy_mappo):
+    from unittest.mock import MagicMock
+
+    writer = MagicMock()
+    dummy_mappo.update(R_bootstrap_agents=None, dt=None,
+                       summary_writer=writer, global_step=1)
+
+    logged_tags = [c.args[0] for c in writer.add_scalar.call_args_list]
+    assert 'train/grad_norm_before_clip' in logged_tags
+    assert 'train/grad_norm_after_clip' in logged_tags
+    assert 'train/grad_norm_ratio' in logged_tags
+    assert 'train/clip_factor' in logged_tags
