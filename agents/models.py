@@ -576,8 +576,24 @@ class MA2PPO_NC(MA2C_NC):
 
                 self.optimizer.zero_grad()
                 loss.backward()
+
+                pre_clip_gn = 0.0
+                for p in self.policy.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        pre_clip_gn += param_norm.item() ** 2
+                pre_clip_gn = pre_clip_gn ** 0.5
+
                 if self.max_grad_norm>0:
                     nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
+                post_clip_gn = 0.0
+                for p in self.policy.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        post_clip_gn += param_norm.item() ** 2
+                post_clip_gn = post_clip_gn ** 0.5
+
                 self.optimizer.step()
 
                 sum_pl += ploss.item()
@@ -603,5 +619,7 @@ class MA2PPO_NC(MA2C_NC):
             summary_writer.add_scalar(f'{self.name}/ppo_critic_loss', avg_vl, global_step)
             summary_writer.add_scalar(f'{self.name}/ppo_entropy_loss', avg_el, global_step)
             summary_writer.add_scalar(f'{self.name}/ppo_total_loss', avg_total, global_step)
+            summary_writer.add_scalar('train/grad_norm_before_clip', pre_clip_gn, global_step)
+            summary_writer.add_scalar('train/grad_norm_after_clip', post_clip_gn, global_step)
             return avg_pl, avg_vl, avg_el, avg_total
         return 0.0,0.0,0.0,0.0
