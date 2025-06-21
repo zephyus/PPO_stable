@@ -139,6 +139,7 @@ class LstmPolicy(Policy):
                 self.entropy_loss,
                 self.loss)
 
+    @torch.no_grad()
     def forward(self, ob, done, naction=None, out_type='p'):
         ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float().to(self.fc_layer.weight.device)
         done = torch.from_numpy(np.expand_dims(done, axis=0)).float().to(self.fc_layer.weight.device)
@@ -305,6 +306,7 @@ class NCMultiAgentPolicy(Policy):
                 self.entropy_loss,
                 self.loss)
 
+    @torch.no_grad()
     def forward(self, ob_N_Do, done_N, fp_N_Dfp, neighbor_actions_N=None, action=None, out_type='p'):
         """Run actor (and optionally critic) for a single timestep.
 
