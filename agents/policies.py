@@ -306,7 +306,10 @@ class NCMultiAgentPolicy(Policy):
                 self.entropy_loss,
                 self.loss)
 
+<<<<<<< HEAD
     @torch.no_grad()
+=======
+>>>>>>> apply-fcee9b1
     def forward(self, ob_N_Do, done_N, fp_N_Dfp, neighbor_actions_N=None, action=None, out_type='p'):
         """Run actor (and optionally critic) for a single timestep.
 
