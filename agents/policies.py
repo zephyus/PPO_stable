@@ -306,10 +306,7 @@ class NCMultiAgentPolicy(Policy):
                 self.entropy_loss,
                 self.loss)
 
-<<<<<<< HEAD
     @torch.no_grad()
-=======
->>>>>>> apply-fcee9b1
     def forward(self, ob_N_Do, done_N, fp_N_Dfp, neighbor_actions_N=None, action=None, out_type='p'):
         """Run actor (and optionally critic) for a single timestep.
 
@@ -622,8 +619,16 @@ class NCMultiAgentPolicy(Policy):
         self.na_ls_ls = []
         self.n_n_ls = []
 
-        self.lstm_layer = nn.LSTM(input_size=3 * self.n_fc, hidden_size=self.n_h, num_layers=1)
-        init_layer(self.lstm_layer, 'lstm')
+        if self.identical:
+            self.lstm_layer = nn.LSTM(input_size=3 * self.n_fc, hidden_size=self.n_h, num_layers=1)
+            init_layer(self.lstm_layer, 'lstm')
+        else:
+            self.lstm_layers = nn.ModuleList([
+                nn.LSTM(input_size=3 * self.n_fc, hidden_size=self.n_h, num_layers=1)
+                for _ in range(self.n_agent)
+            ])
+            for lstm in self.lstm_layers:
+                init_layer(lstm, 'lstm')
 
         # Patch: Conditional GAT initialization
         self.gat_layer = None
@@ -939,7 +944,34 @@ class NCMultiAgentPolicy(Policy):
         h0_lstm = h0.unsqueeze(0)
         c0_lstm = c0.unsqueeze(0)
 
-        lstm_out, (h_T, c_T) = self.lstm_layer(s_for_lstm, (h0_lstm, c0_lstm))
+        if self.identical:
+            # If identical, use the single shared LSTM layer
+            lstm_out, (h_T, c_T) = self.lstm_layer(s_for_lstm, (h0_lstm, c0_lstm))
+        else:
+            # If not identical, loop through each agent's LSTM
+            inputs_per_agent = s_for_lstm.split(1, dim=1)
+            h0_per_agent = h0_lstm.split(1, dim=1)
+            c0_per_agent = c0_lstm.split(1, dim=1)
+
+            all_outputs = []
+            all_h_T = []
+            all_c_T = []
+
+            for i in range(self.n_agent):
+                lstm_i = self.lstm_layers[i]
+                input_i = inputs_per_agent[i]
+                h0_i = h0_per_agent[i]
+                c0_i = c0_per_agent[i]
+                
+                output_i, (h_T_i, c_T_i) = lstm_i(input_i, (h0_i, c0_i))
+                
+                all_outputs.append(output_i)
+                all_h_T.append(h_T_i)
+                all_c_T.append(c_T_i)
+
+            lstm_out = torch.cat(all_outputs, dim=1)
+            h_T = torch.cat(all_h_T, dim=1)
+            c_T = torch.cat(all_c_T, dim=1)
 
         outputs_N_T_H = lstm_out.transpose(0, 1)
 
