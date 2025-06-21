@@ -1,4 +1,5 @@
 #/agents/policies.py
+# 版本: v3.0 - 獨立 LSTM (Independent LSTMs)
 
 import numpy as np
 import torch
