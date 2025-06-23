@@ -160,6 +160,17 @@ class Trainer():
         self.env.train_mode = True
         self.pq = MyQueue(self.model_dir, maxsize=5)
         self.train_results = []
+        
+        # Log agent identical status at trainer initialization
+        if hasattr(self.model, 'identical_agent'):
+            logging.info(f'[Trainer] Model uses identical_agent: {self.model.identical_agent}')
+            if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'identical'):
+                logging.info(f'[Trainer] Policy identical setting: {self.model.policy.identical}')
+        
+        # Initialize counter for limited identical status logging
+        self.identical_log_count = 0
+        self.max_identical_logs = 3  # Only log identical status for first 3 times
+        
         # read GAT dropout schedule from model_config
         if hasattr(self.model, 'model_config') and self.model.model_config:
             self.gat_dropout_init = self.model.model_config.getfloat('gat_dropout_init', 0.2)
@@ -447,7 +458,18 @@ class Trainer():
                         current_lr = 0.0
                         if hasattr(self.model, 'optimizer') and self.model.optimizer:
                             current_lr = self.model.optimizer.param_groups[0]['lr']
-                        logging.info(f"Step: {current_step:<8} | GAT Dropout: {current_gat_dropout:.6f} | LR: {current_lr:.6e}")
+                        
+                        # Log identical status only for first few times
+                        if self.identical_log_count < self.max_identical_logs:
+                            identical_status = "Unknown"
+                            if hasattr(self.model, 'identical_agent'):
+                                identical_status = f"Model:{self.model.identical_agent}"
+                                if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'identical'):
+                                    identical_status += f"|Policy:{self.model.policy.identical}"
+                            logging.info(f"Step: {current_step:<8} | Identical: {identical_status} | GAT Dropout: {current_gat_dropout:.6f} | LR: {current_lr:.6e}")
+                            self.identical_log_count += 1
+                        else:
+                            logging.info(f"Step: {current_step:<8} | GAT Dropout: {current_gat_dropout:.6f} | LR: {current_lr:.6e}")
                         # --- *** 新增 Console Log 結束 *** ---
 
                     # --- dynamic GAT dropout update End ---

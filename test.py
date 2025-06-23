@@ -128,6 +128,14 @@ def train(args):
     seed = config.getint('ENV_CONFIG', 'seed')
     model = init_agent(env, config['MODEL_CONFIG'], total_step, seed)
 
+    # Log identical agent status
+    if hasattr(model, 'identical_agent'):
+        logging.info(f'Model identical_agent status: {model.identical_agent}')
+        if hasattr(model, 'policy') and hasattr(model.policy, 'identical'):
+            logging.info(f'Policy identical status: {model.policy.identical}')
+    else:
+        logging.warning('Model does not have identical_agent attribute')
+
     model.load(dirs['model'], train_mode=True)
 
     # disable multi-threading for safe SUMO implementation

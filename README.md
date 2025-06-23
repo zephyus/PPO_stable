@@ -119,7 +119,7 @@ tmux attach -t training_ppo_0617
 ## 📊 選用：啟動 TensorBoard（查看所有 PPO Log）
 
 ```bash
-tensorboard --logdir=/home/russell512/deeprl_0611_ppo/real_a1 --port=6010
+tensorboard --logdir=/home/russell512/gpu1_0621_ppo_lstm/real_a1 --port=6010
 ```
 
 > 瀏覽器開啟：[http://localhost:6010](http://localhost:6010)

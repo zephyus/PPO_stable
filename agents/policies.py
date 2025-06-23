@@ -621,9 +621,13 @@ class NCMultiAgentPolicy(Policy):
         self.n_n_ls = []
 
         if self.identical:
+            logging.info(f"[NCMultiAgentPolicy] Creating shared LSTM layer for {self.n_agent} agents (identical=True)")
+            logging.info(f"[NCMultiAgentPolicy] All agents will share the same LSTM weights")
             self.lstm_layer = nn.LSTM(input_size=3 * self.n_fc, hidden_size=self.n_h, num_layers=1)
             init_layer(self.lstm_layer, 'lstm')
         else:
+            logging.info(f"[NCMultiAgentPolicy] Creating {self.n_agent} independent LSTM layers (identical=False)")
+            logging.info(f"[NCMultiAgentPolicy] Each agent will have its own separate LSTM weights")
             self.lstm_layers = nn.ModuleList([
                 nn.LSTM(input_size=3 * self.n_fc, hidden_size=self.n_h, num_layers=1)
                 for _ in range(self.n_agent)
@@ -677,6 +681,13 @@ class NCMultiAgentPolicy(Policy):
             init_layer(self.shared_value_head, 'fc')
             self._init_actor_head(self.n_a)
             self.ppo_value_heads = nn.ModuleList([self.shared_value_head])
+            logging.info(f"[NCMultiAgentPolicy] Created shared actor and value heads (identical=True)")
+            logging.info(f"[NCMultiAgentPolicy] All agents will share the same actor/critic weights")
+        else:
+            logging.info(f"[NCMultiAgentPolicy] Creating {self.n_agent} independent actor and value heads (identical=False)")
+            logging.info(f"[NCMultiAgentPolicy] Each agent will have its own separate actor/critic weights")
+            logging.info(f"[NCMultiAgentPolicy] Created shared actor and value heads (identical=True)")
+            logging.info(f"[NCMultiAgentPolicy] All agents will share the same actor/critic weights")
 
         for i in range(self.n_agent):
             n_n, n_ns, n_na, ns_ls, na_ls = self._get_neighbor_dim(i)
